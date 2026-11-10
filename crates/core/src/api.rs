@@ -82,6 +82,11 @@ impl Api {
         self.yt = connect().await;
     }
 
+    /// Not even anonymous: `reload_auth` to retry.
+    pub fn is_down(&self) -> bool {
+        matches!(self.yt, Yt::Down(_))
+    }
+
     pub fn is_logged_in(&self) -> bool {
         matches!(self.yt, Yt::Auth(_))
     }
@@ -203,17 +208,25 @@ impl Api {
     }
 }
 
+/// ytmapi-rs has no request timeout: a network that never answers would hang forever.
+pub(crate) const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 async fn connect() -> Yt {
-    if let Some(cookie) = auth::cookie_header() {
-        match YtMusic::from_cookie(cookie).await {
-            Ok(yt) => return Yt::Auth(yt),
-            Err(e) => log::warn!("login cookies unusable, going anonymous: {e}"),
+    let connect = async {
+        if let Some(cookie) = auth::cookie_header() {
+            match YtMusic::from_cookie(cookie).await {
+                Ok(yt) => return Yt::Auth(yt),
+                Err(e) => log::warn!("login cookies unusable, going anonymous: {e}"),
+            }
         }
-    }
-    match YtMusic::new_unauthenticated().await {
-        Ok(yt) => Yt::Anon(yt),
-        Err(e) => Yt::Down(format!("cannot reach YouTube Music: {e}")),
-    }
+        match YtMusic::new_unauthenticated().await {
+            Ok(yt) => Yt::Anon(yt),
+            Err(e) => Yt::Down(format!("cannot reach YouTube Music: {e}")),
+        }
+    };
+    tokio::time::timeout(TIMEOUT, connect)
+        .await
+        .unwrap_or_else(|_| Yt::Down("cannot reach YouTube Music: timed out".into()))
 }
 
 /// Pages that work without an account.

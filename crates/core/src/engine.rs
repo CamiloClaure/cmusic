@@ -10,7 +10,7 @@
 use crate::api::{Api, ApiError};
 use crate::media::Media;
 use crate::player::mpv::{MpvEvent, MpvPlayer};
-use crate::player::state::{reduce, Effect, Event, State, Stream};
+use crate::player::state::{reduce, Effect, EndReason, Event, State, Stream};
 use crate::types::{Command, Lyrics, Rating, Snapshot, Status, Track, Update};
 use crate::{auth, lyrics, persist, resolve};
 use futures::future::{BoxFuture, FutureExt};
@@ -81,8 +81,9 @@ enum Msg {
 
 /// The test seam: everything with side effects outside this thread.
 trait Backend {
-    /// Player effects (everything except `Resolve`, `FetchRadio` and `Persist`).
-    fn play(&self, fx: &Effect);
+    /// Player effects (everything except `Resolve`, `FetchRadio` and `Persist`). `Err` when
+    /// mpv refused a `Load` or `AppendNext`.
+    fn play(&self, fx: &Effect) -> Result<(), String>;
     fn resolve(&self, video_id: String) -> BoxFuture<'static, Result<Stream, String>>;
     fn radio(&self, video_id: String) -> BoxFuture<'static, Result<Vec<Track>, String>>;
     fn lyrics(&self, track: Track) -> BoxFuture<'static, Option<Lyrics>>;
@@ -94,11 +95,11 @@ struct Real {
 }
 
 impl Backend for Real {
-    fn play(&self, fx: &Effect) {
+    fn play(&self, fx: &Effect) -> Result<(), String> {
         let m = &self.mpv;
         match fx {
-            Effect::Load(s) => m.load(s),
-            Effect::AppendNext(s) => m.append_next(s),
+            Effect::Load(s) => return m.load(s),
+            Effect::AppendNext(s) => return m.append_next(s),
             Effect::ClearNext => m.clear_next(),
             Effect::SetPause(p) => m.set_pause(*p),
             Effect::Seek(secs) => m.seek(*secs),
@@ -107,6 +108,7 @@ impl Backend for Real {
             Effect::Stop => m.stop(),
             Effect::Resolve(_) | Effect::FetchRadio(_) | Effect::Persist => {}
         }
+        Ok(())
     }
 
     fn resolve(&self, video_id: String) -> BoxFuture<'static, Result<Stream, String>> {
@@ -119,12 +121,9 @@ impl Backend for Real {
 
     fn radio(&self, video_id: String) -> BoxFuture<'static, Result<Vec<Track>, String>> {
         let api = self.api.clone();
-        async move {
-            let g = api.read().await;
-            g.as_ref().ok_or_else(not_connected)?.radio(&video_id).await
-        }
-        .map(|r| r.map_err(|e| e.to_string()))
-        .boxed()
+        async move { with_api(&api, async |a| a.radio(&video_id).await).await }
+            .map(|r| r.map_err(|e| e.to_string()))
+            .boxed()
     }
 
     fn lyrics(&self, track: Track) -> BoxFuture<'static, Option<Lyrics>> {
@@ -133,8 +132,7 @@ impl Backend for Real {
             if let Some(l) = lyrics::fetch(&track).await {
                 return Some(l);
             }
-            let g = api.read().await;
-            match g.as_ref()?.lyrics(&track.video_id).await {
+            match with_api(&api, async |a| a.lyrics(&track.video_id).await).await {
                 Ok(text) => text.map(|t| lyrics::plain(&t)),
                 Err(e) => {
                     log::debug!("lyrics for {}: {e}", track.video_id);
@@ -148,6 +146,25 @@ impl Backend for Real {
 
 fn not_connected() -> ApiError {
     ApiError::Other("YouTube Music is not connected".into())
+}
+
+/// Runs `f` against the API: waits for the first connection, reconnects first when it is down
+/// (started offline), and gives up after `api::TIMEOUT`.
+async fn with_api<T>(
+    api: &ApiCell,
+    f: impl AsyncFnOnce(&Api) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    if api.read().await.as_ref().is_some_and(Api::is_down) {
+        let mut g = api.write().await;
+        if let Some(a) = g.as_mut().filter(|a| a.is_down()) {
+            a.reload_auth().await;
+        }
+    }
+    let g = api.read().await;
+    let a = g.as_ref().ok_or_else(not_connected)?;
+    tokio::time::timeout(crate::api::TIMEOUT, f(a))
+        .await
+        .unwrap_or_else(|_| Err(ApiError::Other("YouTube Music timed out".into())))
 }
 
 fn from_mpv(e: MpvEvent) -> Event {
@@ -273,7 +290,7 @@ impl Engine {
                 }
             }
         }
-        self.backend.play(&Effect::Stop);
+        let _ = self.backend.play(&Effect::Stop);
         self.save();
     }
 
@@ -316,20 +333,31 @@ impl Engine {
                 });
             }
             Effect::FetchRadio(video_id) => {
-                let fut = self.backend.radio(video_id);
+                let fut = self.backend.radio(video_id.clone());
                 tokio::spawn(async move {
                     let tracks = fut.await.unwrap_or_else(|e| {
                         let _ = tx.send(Msg::Up(Update::Notice(format!("Autoplay: {e}"))));
                         Vec::new()
                     });
-                    let _ = tx.send(Msg::Ev(Event::RadioFetched(tracks)));
+                    let _ = tx.send(Msg::Ev(Event::RadioFetched(video_id, tracks)));
                 });
             }
             Effect::Persist => {
                 self.save_at
                     .get_or_insert_with(|| Instant::now() + SAVE_DEBOUNCE);
             }
-            fx => self.backend.play(&fx),
+            fx => {
+                if let Err(e) = self.backend.play(&fx) {
+                    log::warn!("{e}");
+                    // Through the channel, after the effects of this event.
+                    let ev = match fx {
+                        Effect::Load(_) => Event::EndFile(EndReason::Error(e)),
+                        Effect::AppendNext(_) => Event::AppendFailed,
+                        _ => return,
+                    };
+                    let _ = tx.send(Msg::Ev(ev));
+                }
+            }
         }
     }
 
@@ -396,11 +424,9 @@ async fn account(api: &ApiCell, cmd: Command) -> Vec<Update> {
             Update::AuthRequired("Cookies saved, but YouTube Music did not accept them".into())
         }];
     }
-    let g = api.read().await;
-    let api = g.as_ref().ok_or_else(not_connected);
     let (result, ok) = match cmd {
         Command::Fetch(request) => {
-            let result = async { api?.fetch(&request).await }.await;
+            let result = with_api(api, async |a| a.fetch(&request).await).await;
             let mut out = Vec::new();
             if let Err(ApiError::Auth(m)) = &result {
                 out.push(Update::AuthRequired(m.clone()));
@@ -410,7 +436,7 @@ async fn account(api: &ApiCell, cmd: Command) -> Vec<Update> {
             return out;
         }
         Command::Rate { video_id, rating } => (
-            async { api?.rate(&video_id, rating).await }.await,
+            with_api(api, async |a| a.rate(&video_id, rating).await).await,
             match rating {
                 Rating::Like => "Liked",
                 Rating::Dislike => "Disliked",
@@ -421,14 +447,20 @@ async fn account(api: &ApiCell, cmd: Command) -> Vec<Update> {
             playlist_id,
             video_id,
         } => (
-            async { api?.add_to_playlist(&playlist_id, &video_id).await }.await,
+            with_api(api, async |a| {
+                a.add_to_playlist(&playlist_id, &video_id).await
+            })
+            .await,
             "Added to playlist",
         ),
         Command::RemoveFromPlaylist {
             playlist_id,
             video_id,
         } => (
-            async { api?.remove_from_playlist(&playlist_id, &video_id).await }.await,
+            with_api(api, async |a| {
+                a.remove_from_playlist(&playlist_id, &video_id).await
+            })
+            .await,
             "Removed from playlist",
         ),
         _ => return Vec::new(),
@@ -443,25 +475,29 @@ async fn account(api: &ApiCell, cmd: Command) -> Vec<Update> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::state::EndReason;
     use std::sync::Mutex;
 
     type Log = Arc<Mutex<Vec<String>>>;
 
     /// Resolves instantly to `Stream { url: id }` except for `fail`; records player calls.
+    /// mpv refuses to load ids starting with `!`.
     struct Fake {
         log: Log,
         fail: &'static str,
     }
 
     impl Backend for Fake {
-        fn play(&self, fx: &Effect) {
-            let line = match fx {
-                Effect::Load(s) => format!("load {}", s.url),
-                Effect::AppendNext(s) => format!("append {}", s.url),
-                fx => format!("{fx:?}"),
+        fn play(&self, fx: &Effect) -> Result<(), String> {
+            let (line, refused) = match fx {
+                Effect::Load(s) => (format!("load {}", s.url), s.url.starts_with('!')),
+                Effect::AppendNext(s) => (format!("append {}", s.url), s.url.starts_with('!')),
+                fx => (format!("{fx:?}"), false),
             };
             self.log.lock().unwrap().push(line);
+            if refused {
+                return Err("refused".into());
+            }
+            Ok(())
         }
         fn resolve(&self, id: String) -> BoxFuture<'static, Result<Stream, String>> {
             let fail = id == self.fail;
@@ -607,6 +643,24 @@ mod tests {
             .iter()
             .any(|s| s.cursor == Some(2) && s.last_error.as_deref() == Some("b unavailable")));
         assert!(!log.lock().unwrap().iter().any(|l| l.ends_with(" b")));
+    }
+
+    #[tokio::test]
+    async fn refused_loads_reach_the_reducer() {
+        let r = rig("refused", "");
+        r.handle.send(play(&["a", "!b", "c"]));
+        r.wait_for("load a").await;
+        r.ev(Event::FileLoaded);
+        r.wait_for("append !b").await;
+        // The append was refused, so end of track takes the normal path and loads it...
+        r.ev(Event::EndFile(EndReason::Eof));
+        r.wait_for("load !b").await;
+        // ...whose refusal skips to the next track instead of waiting in Loading.
+        r.wait_for("load c").await;
+        let snaps = r.finish().await;
+        assert!(snaps
+            .iter()
+            .any(|s| s.cursor == Some(2) && s.last_error.as_deref() == Some("refused")));
     }
 
     #[tokio::test]

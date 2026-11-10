@@ -47,8 +47,10 @@ pub enum Event {
     Duration(f64),
     /// mpv `paused-for-cache`.
     Buffering(bool),
-    /// Answer to `Effect::FetchRadio`, possibly empty.
-    RadioFetched(Vec<Track>),
+    /// Answer to `Effect::FetchRadio`: the seed video id and its tracks, possibly empty.
+    RadioFetched(String, Vec<Track>),
+    /// mpv refused the `AppendNext`: nothing is appended after all.
+    AppendFailed,
     /// The saved session, sent once at startup. Comes back `Idle` without playing; the next
     /// `TogglePause` starts the current track and seeks to `position_secs`.
     Restored {
@@ -117,7 +119,8 @@ pub struct State {
     last_error: Option<String>,
     /// Failures since the last successful `FileLoaded`.
     failures: u8,
-    radio_pending: bool,
+    /// Seed of the radio fetch in flight.
+    radio_pending: Option<String>,
     /// Restored position, applied on the next `FileLoaded`.
     resume_at: Option<f64>,
 }
@@ -137,7 +140,7 @@ impl State {
             normalize: false,
             last_error: None,
             failures: 0,
-            radio_pending: false,
+            radio_pending: None,
             resume_at: None,
         }
     }
@@ -148,7 +151,8 @@ impl State {
             status: self.status,
             queue: self.queue.tracks(),
             cursor: self.queue.cursor(),
-            position_secs: self.position,
+            // Until the restored position is applied, it is the one to show and save.
+            position_secs: self.resume_at.unwrap_or(self.position),
             duration_secs: self.duration,
             volume: self.volume,
             shuffle: self.queue.shuffle(),
@@ -184,7 +188,7 @@ impl State {
         match command {
             Command::PlayTracks { tracks, start } if !tracks.is_empty() => {
                 self.queue.replace(tracks, start);
-                self.radio_pending = false;
+                self.radio_pending = None;
                 self.unpause(fx);
                 self.change_track(fx);
             }
@@ -227,7 +231,7 @@ impl State {
             }
             Command::ClearQueue if !self.queue.is_empty() => {
                 self.queue.clear();
-                self.radio_pending = false;
+                self.radio_pending = None;
                 self.resume_at = None;
                 self.go_idle(fx);
                 fx.push(Effect::Persist);
@@ -373,13 +377,13 @@ impl State {
         }
         let active = self.status == Status::Loading || self.loaded();
         if active
-            && !self.radio_pending
+            && self.radio_pending.is_none()
             && self.queue.repeat() == Repeat::Off
             && self.queue.remaining() <= 2
         {
             if let Some(track) = self.queue.current() {
                 fx.push(Effect::FetchRadio(track.video_id.clone()));
-                self.radio_pending = true;
+                self.radio_pending = Some(track.video_id.clone());
             }
         }
     }
@@ -388,6 +392,7 @@ impl State {
     fn fail(&mut self, message: String, fx: &mut Vec<Effect>) {
         self.failures = self.failures.saturating_add(1);
         self.last_error = Some(message);
+        self.resume_at = None;
         if self.failures >= 3 {
             // Nothing can be appended here: an appended next implies a FileLoaded, which
             // reset the count.
@@ -436,7 +441,8 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
         // Eof while not loaded is the old file finishing during a track change.
         Event::EndFile(EndReason::Eof) if st.loaded() => {
             let gapless = matches!(st.next, Next::Appended(_));
-            st.load_sent = gapless; // without an appended entry mpv is now empty
+            // mpv may have moved to an entry cleared a moment ago: the next `start` must `Stop` it.
+            st.load_sent = true;
             if !st.queue.advance(false) {
                 st.go_idle(&mut fx);
             } else if gapless {
@@ -476,8 +482,9 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
                 st.play_status()
             };
         }
-        Event::RadioFetched(tracks) if st.radio_pending => {
-            st.radio_pending = false;
+        Event::AppendFailed if matches!(st.next, Next::Appended(_)) => st.next = Next::Empty,
+        Event::RadioFetched(seed, tracks) if st.radio_pending.as_ref() == Some(&seed) => {
+            st.radio_pending = None;
             let mut new: Vec<Track> = Vec::new();
             for t in tracks {
                 if !st.queue.contains(&t.video_id) && !new.iter().any(|n| n.video_id == t.video_id)
@@ -511,7 +518,7 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
             st.resume_at = (st.position > 0.0).then_some(st.position);
             st.volume = volume.min(100);
             st.normalize = normalize;
-            st.radio_pending = false;
+            st.radio_pending = None;
             st.failures = 0;
             st.last_error = None;
             fx.push(Effect::SetVolume(st.volume));
@@ -614,7 +621,8 @@ mod tests {
 
     #[test]
     fn flows() {
-        use Event::{EndFile, FileLoaded, RadioFetched};
+        use Event::{AppendFailed, EndFile, FileLoaded};
+        let radio = |seed: &str, ids| Event::RadioFetched(seed.into(), tracks(ids));
         use Status::{Buffering, Error, Idle, Loading, Paused, Playing};
         let eof = || EndFile(EndReason::Eof);
         #[rustfmt::skip]
@@ -626,21 +634,28 @@ mod tests {
                 vec![r("a"), Persist, load("a"), r("b")], Playing, Some(0)),
             ("eof advances, reusing the in-flight resolve", playing(ABCDE, 0),
                 vec![eof(), resolved("b"), FileLoaded],
-                vec![Persist, load("b"), r("c")], Playing, Some(1)),
+                vec![Stop, Persist, load("b"), r("c")], Playing, Some(1)),
             ("gapless advance with appended next", playing(ABCDE, 0),
                 vec![resolved("b"), eof(), FileLoaded],
                 vec![AppendNext(stream("b")), Persist, r("c")], Playing, Some(1)),
+            ("eof racing a cleared next stops mpv's own advance", playing(ABCDE, 0),
+                vec![resolved("b"), cmd(Command::PlayNext(tracks("x"))), eof()],
+                vec![AppendNext(stream("b")), ClearNext, r("x"), Persist, Stop, Persist],
+                Loading, Some(1)),
+            ("failed append falls back to a normal advance", playing(ABCDE, 0),
+                vec![resolved("b"), AppendFailed, eof()],
+                vec![AppendNext(stream("b")), Stop, r("b"), Persist], Loading, Some(1)),
             ("last tracks trigger autoplay fetch", State::new(1), vec![play("a b", 0)],
                 vec![r("a"), FetchRadio("a".into()), Persist], Loading, Some(0)),
             ("radio continues the queue", playing("a", 0),
-                vec![RadioFetched(tracks("a x y z")), resolved("x"), eof(), FileLoaded],
+                vec![radio("a", "a x y z"), resolved("x"), eof(), FileLoaded],
                 vec![r("x"), Persist, AppendNext(stream("x")), FetchRadio("x".into()), Persist,
                      r("y")], Playing, Some(1)),
             ("radio arriving after the end resumes", playing("a", 0),
-                vec![eof(), RadioFetched(tracks("x"))],
-                vec![r("x"), FetchRadio("x".into()), Persist], Loading, Some(1)),
+                vec![eof(), radio("a", "x")],
+                vec![Stop, r("x"), FetchRadio("x".into()), Persist], Loading, Some(1)),
             ("queue end without radio goes idle", playing("a", 0),
-                vec![RadioFetched(Vec::new()), eof()], vec![], Idle, Some(0)),
+                vec![radio("a", ""), eof()], vec![Stop], Idle, Some(0)),
             ("failed resolve skips", State::new(1), vec![play(ABCDE, 0), failed("a")],
                 vec![r("a"), Persist, r("b"), Persist], Loading, Some(1)),
             ("load error skips", State::new(1),
@@ -676,7 +691,7 @@ mod tests {
                 Playing, Some(0)),
             ("repeat all wraps", State::new(1),
                 vec![cmd(Command::CycleRepeat), play(ABCDE, 4), resolved("e"), FileLoaded, eof()],
-                vec![Persist, r("e"), Persist, load("e"), r("a"), Persist], Loading, Some(0)),
+                vec![Persist, r("e"), Persist, load("e"), r("a"), Stop, Persist], Loading, Some(0)),
             ("play-next replaces the appended next", playing(ABCDE, 0),
                 vec![resolved("b"), cmd(Command::PlayNext(tracks("x")))],
                 vec![AppendNext(stream("b")), ClearNext, r("x"), Persist], Playing, Some(0)),
@@ -773,13 +788,20 @@ mod tests {
             !fx.iter().any(|e| matches!(e, FetchRadio(_))),
             "still pending: {fx:?}"
         );
-        feed(&mut st, vec![Event::RadioFetched(tracks("a b x x y"))]);
+        let radio = |seed: &str, ids| Event::RadioFetched(seed.into(), tracks(ids));
+        feed(&mut st, vec![radio("a", "a b x x y")]);
         assert_eq!(ids(&st), "a b x y");
         // A late answer after the queue was replaced is dropped.
         let mut st = playing(ABCDE, 3);
         feed(&mut st, vec![play("p q r s t u", 0)]);
-        feed(&mut st, vec![Event::RadioFetched(tracks("z"))]);
+        feed(&mut st, vec![radio("d", "z")]);
         assert_eq!(ids(&st), "p q r s t u");
+        // Even when the new queue has its own fetch pending: only its answer counts.
+        let mut st = playing("a b", 0);
+        let fx = feed(&mut st, vec![play("p q", 0)]);
+        assert!(fx.contains(&FetchRadio("p".into())), "{fx:?}");
+        feed(&mut st, vec![radio("a", "x"), radio("p", "y")]);
+        assert_eq!(ids(&st), "p q y");
     }
 
     #[test]
@@ -808,6 +830,29 @@ mod tests {
             vec![cmd(Command::TogglePause), resolved("b"), Event::FileLoaded],
         );
         assert_eq!(fx, [r("b"), load("b"), Seek(42.0), r("c")]);
+    }
+
+    #[test]
+    fn restored_position_survives_resolving_but_not_a_failure() {
+        let mut st = State::new(1);
+        feed(
+            &mut st,
+            vec![Event::Restored {
+                queue: tracks(ABCDE),
+                cursor: Some(1),
+                position_secs: 42.0,
+                volume: 100,
+                shuffle: false,
+                repeat: Repeat::Off,
+                normalize: false,
+            }],
+        );
+        feed(&mut st, vec![cmd(Command::TogglePause)]);
+        assert_eq!(st.status, Status::Loading);
+        assert_eq!(st.snapshot().position_secs, 42.0, "saved while resolving");
+        let fx = feed(&mut st, vec![failed("b"), resolved("c"), Event::FileLoaded]);
+        assert!(!fx.iter().any(|e| matches!(e, Seek(_))), "{fx:?}");
+        assert_eq!(st.snapshot().position_secs, 0.0);
     }
 
     #[test]
@@ -922,8 +967,9 @@ mod tests {
                 Event::Duration(f64::NAN),
                 Event::Buffering(true),
                 Event::Buffering(false),
-                Event::RadioFetched(tracks("a r s")),
-                Event::RadioFetched(Vec::new()),
+                Event::RadioFetched("a".into(), tracks("a r s")),
+                Event::RadioFetched("b".into(), Vec::new()),
+                Event::AppendFailed,
             ]
         };
         let n = pool().len() as u64;

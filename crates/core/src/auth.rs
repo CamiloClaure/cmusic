@@ -126,7 +126,10 @@ fn from_browsers() -> Result<Vec<Row>, String> {
 fn parse_header(s: &str) -> Vec<Row> {
     let quotes = |c: char| c == '"' || c == '\'';
     let mut s = s.trim().trim_matches(quotes).trim();
-    if s.len() >= 7 && s[..7].eq_ignore_ascii_case("cookie:") {
+    // `get` because byte 7 may sit inside a multi-byte character.
+    if s.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("cookie:"))
+    {
         s = &s[7..];
     }
     let expires = std::time::SystemTime::now()
@@ -281,6 +284,8 @@ mod tests {
             );
         }
         assert!(parse_header("garbage; =novalue").is_empty());
+        // Byte 7 is inside the `é`: no panic.
+        assert_eq!(pairs(&parse_header("abcdefé=1")), [("abcdefé", "1")]);
     }
 
     #[test]

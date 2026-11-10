@@ -122,16 +122,16 @@ impl MpvPlayer {
         })
     }
 
-    /// Replace the playlist and start playing `s`.
-    pub fn load(&self, s: &Stream) {
-        self.loadfile(s, "replace");
+    /// Replace the playlist and start playing `s`. `Err` when mpv refused the command.
+    pub fn load(&self, s: &Stream) -> Result<(), String> {
+        self.loadfile(s, "replace")
     }
 
-    /// Append `s` as the gapless next entry.
-    pub fn append_next(&self, s: &Stream) {
+    /// Append `s` as the gapless next entry. `Err` when mpv refused the command.
+    pub fn append_next(&self, s: &Stream) -> Result<(), String> {
         // After a gapless advance the finished entry is still listed: keep it to two.
         self.clear_next();
-        self.loadfile(s, "append");
+        self.loadfile(s, "append")
     }
 
     /// Remove every playlist entry except the one playing.
@@ -174,8 +174,10 @@ impl MpvPlayer {
         }
     }
 
-    fn loadfile(&self, s: &Stream, mode: &str) {
-        self.cmd("loadfile", &[&s.url, mode, "-1", &file_options(&s.headers)]);
+    fn loadfile(&self, s: &Stream, mode: &str) -> Result<(), String> {
+        self.mpv
+            .command("loadfile", &[&s.url, mode, "-1", &file_options(&s.headers)])
+            .map_err(|e| format!("mpv could not load the stream ({e})"))
     }
 }
 
@@ -270,7 +272,7 @@ mod tests {
     async fn plays_real_stream() {
         let s = resolve("dQw4w9WgXcQ", None).await.unwrap();
         let (p, rx) = player();
-        p.load(&s);
+        p.load(&s).unwrap();
         let evs = collect(&rx, 30, |v| {
             v.iter()
                 .filter(|e| matches!(e, MpvEvent::TimePos(_)))
@@ -292,8 +294,8 @@ mod tests {
     async fn gapless_transition() {
         let s = resolve("dQw4w9WgXcQ", None).await.unwrap();
         let (p, rx) = player();
-        p.load(&s);
-        p.append_next(&s);
+        p.load(&s).unwrap();
+        p.append_next(&s).unwrap();
         let evs = collect(&rx, 30, |v| {
             v.iter().any(|e| matches!(e, MpvEvent::Duration(_)))
         });
@@ -342,9 +344,9 @@ mod tests {
     async fn load_replaces_playing_file_as_stopped() {
         let s = resolve("dQw4w9WgXcQ", None).await.unwrap();
         let (p, rx) = player();
-        p.load(&s);
+        p.load(&s).unwrap();
         collect(&rx, 30, |v| v.contains(&MpvEvent::FileLoaded));
-        p.load(&s);
+        p.load(&s).unwrap();
         let evs = collect(&rx, 30, |v| v.contains(&MpvEvent::FileLoaded));
         println!("{evs:?}");
         assert!(!evs.contains(&MpvEvent::EndFile(EndReason::Eof)));
@@ -361,7 +363,8 @@ mod tests {
         p.load(&Stream {
             url: "https://127.0.0.1:9/nope".into(),
             headers: vec![],
-        });
+        })
+        .unwrap();
         let evs = collect(&rx, 20, |v| {
             v.iter().any(|e| matches!(e, MpvEvent::EndFile(_)))
         });

@@ -5,7 +5,7 @@ use app::App;
 use cmusic_core::engine::{start, Options};
 use cmusic_core::{auth, Command, CookieSource, Update};
 use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -58,7 +58,7 @@ fn login(args: &[&str]) -> i32 {
             eprint!("Paste the Cookie header value, then Enter: ");
             let _ = std::io::stderr().flush();
             let mut s = String::new();
-            if std::io::stdin().read_to_string(&mut s).is_err() {
+            if std::io::stdin().read_line(&mut s).is_err() {
                 eprintln!("could not read stdin");
                 return 1;
             }
