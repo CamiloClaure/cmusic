@@ -68,6 +68,21 @@ impl MpvPlayer {
                 .map_err(|e| format!("mpv observe {name} failed: {e}"))?;
         }
 
+        // Forward mpv's own warnings and errors to the log.
+        // ponytail: libmpv2 does not wrap mpv_request_log_messages (and the sys crate is not a
+        // direct dependency), so declare the one C function; libmpv is already linked.
+        extern "C" {
+            fn mpv_request_log_messages(
+                ctx: *mut std::ffi::c_void,
+                level: *const std::ffi::c_char,
+            ) -> std::ffi::c_int;
+        }
+        // SAFETY: `ctx` is the live handle of `client`; the level is a NUL-terminated literal.
+        let rc = unsafe { mpv_request_log_messages(client.ctx.as_ptr().cast(), c"warn".as_ptr()) };
+        if rc < 0 {
+            log::warn!("mpv log messages unavailable: error {rc}");
+        }
+
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = std::thread::Builder::new()
@@ -81,6 +96,7 @@ impl MpvPlayer {
                         // libmpv2 reports an end-file that carries an error as Err
                         // and drops the event, so every Err here is a failed file.
                         Some(Err(e)) => {
+                            log::debug!("mpv event error: {e}");
                             on_event(MpvEvent::EndFile(EndReason::Error(describe(&e))));
                             continue;
                         }
@@ -107,9 +123,23 @@ impl MpvPlayer {
                             }
                             _ => continue,
                         },
+                        Event::LogMessage {
+                            prefix,
+                            level,
+                            text,
+                            ..
+                        } => {
+                            let lvl = match level {
+                                "fatal" | "error" => log::Level::Error,
+                                _ => log::Level::Warn,
+                            };
+                            log::log!(target: "mpv", lvl, "[{prefix}] {}", text.trim_end());
+                            continue;
+                        }
                         Event::Shutdown => break,
                         _ => continue,
                     };
+                    log::debug!("mpv event {out:?}");
                     on_event(out);
                 }
             })
@@ -140,7 +170,11 @@ impl MpvPlayer {
     }
 
     pub fn set_pause(&self, paused: bool) {
-        if let Err(e) = self.mpv.set_property("pause", paused) {
+        let t = std::time::Instant::now();
+        log::debug!("mpv set pause={paused} start");
+        let r = self.mpv.set_property("pause", paused);
+        log::debug!("mpv set pause end {}ms", t.elapsed().as_millis());
+        if let Err(e) = r {
             log::warn!("mpv pause: {e}");
         }
     }
@@ -169,15 +203,26 @@ impl MpvPlayer {
     }
 
     fn cmd(&self, name: &str, args: &[&str]) {
-        if let Err(e) = self.mpv.command(name, args) {
+        let t = std::time::Instant::now();
+        log::debug!("mpv command {name} start");
+        let r = self.mpv.command(name, args);
+        log::debug!("mpv command {name} end {}ms", t.elapsed().as_millis());
+        if let Err(e) = r {
             log::warn!("mpv {name}: {e}");
         }
     }
 
     fn loadfile(&self, s: &Stream, mode: &str) -> Result<(), String> {
-        self.mpv
-            .command("loadfile", &[&s.url, mode, "-1", &file_options(&s.headers)])
-            .map_err(|e| format!("mpv could not load the stream ({e})"))
+        let t = std::time::Instant::now();
+        log::debug!("mpv command loadfile {mode} start");
+        let r = self
+            .mpv
+            .command("loadfile", &[&s.url, mode, "-1", &file_options(&s.headers)]);
+        log::debug!(
+            "mpv command loadfile {mode} end {}ms",
+            t.elapsed().as_millis()
+        );
+        r.map_err(|e| format!("mpv could not load the stream ({e})"))
     }
 }
 

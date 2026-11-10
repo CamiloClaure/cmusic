@@ -67,5 +67,26 @@ Colours are `"#rrggbb"` or `"#rrggbbaa"`.
 | `backdrop_blur` | number 0-30 | Blur radius of the backdrop |
 | `backdrop_saturation` | number 0-4 | Colour boost of the backdrop |
 
+## Debugging
+Environment variables (all front ends):
+
+| Variable | Effect |
+|---|---|
+| `CMUSIC_LOG=<file>` | Append a log (`<secs> <LEVEL> <target>: <message>`), debug for cmusic and warn for the rest, mpv warnings included. Never holds cookies or stream URLs. `CMUSIC_LOG_LEVEL=trace\|debug\|info\|warn` changes the cmusic level |
+| `CMUSIC_AO=<driver>` | mpv audio output, e.g. `null` without audio or `pulse` |
+| `CMUSIC_STATE_DIR=<dir>` | Keep session and prefs there, leaving your saved session untouched |
+
+Headless script through the real engine (prints every update, `TTFA <ms> <id>` for time to first audio, `HANG` and exit 3 after 20 s of silence while playing; exit 0 at the end):
+
+```
+CMUSIC_AO=null cargo run --release -p cmusic-core --example play -- search:"daft punk" wait:15 seek:60 pause wait:2 resume next wait:10 quit
+```
+
+Steps: `play:<id>[,<id>...]`, `search:<query>`, `wait:<secs>`, `seek:<secs>`, `pause`, `resume`, `toggle`, `next`, `prev`, `volume:<0-100>`, `remove:<index>`, `shuffle`, `repeat`, `fetch:<liked|playlists|songs|albums|artists>`, `quit`. The old `play -- <id> [secs]` form still works.
+
+Desktop app script: `CMUSIC_DEMO_SCRIPT="step;step;..."` runs the steps in order and is inert when unset. Under WSLg unset `WAYLAND_DISPLAY` so it uses X11.
+
+Steps: `search:<query>`, `waitpage` (next page update, max 30 s), `play:<row>`, `wait:<secs>`, `seek:<secs>` and `seekfrac:<0..1>` (a slider drag), `pause`, `next`, `prev`, `lyrics`, `login`, `theme`, `open:<liked|playlists|songs|albums|artists>`, `state` (one line on stderr), `shot:<path.png>`, `quit`.
+
 ## License
 GPL-3.0-only

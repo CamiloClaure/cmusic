@@ -42,6 +42,7 @@ pub struct Options {
 
 /// Starts the engine thread. Fails only when the runtime or mpv cannot be created.
 pub fn start(opts: Options) -> Result<(Handle, UnboundedReceiver<Update>), String> {
+    crate::logger::init();
     // Raw pointers are not Send; the handle is only passed through to souvlaki.
     let hwnd = opts.hwnd.map(|p| p as usize);
     spawn(persist::state_path(), move |tx| {
@@ -142,6 +143,21 @@ impl Backend for Real {
         }
         .boxed()
     }
+}
+
+/// Variant name of a Debug value, without its payload (which may hold URLs or cookies).
+fn head(v: &impl std::fmt::Debug) -> String {
+    let d = format!("{v:?}");
+    d.chars().take_while(|c| c.is_alphanumeric()).collect()
+}
+
+/// `host itag=N` of a stream URL; never the query string itself.
+fn url_info(url: &str) -> String {
+    let host = url.split("://").nth(1).and_then(|r| r.split('/').next());
+    let itag = url
+        .split_once('?')
+        .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("itag=")));
+    format!("{} itag={}", host.unwrap_or("?"), itag.unwrap_or("?"))
 }
 
 fn not_connected() -> ApiError {
@@ -295,6 +311,7 @@ impl Engine {
     }
 
     fn command(&mut self, c: Command) {
+        log::debug!("command {}", head(&c));
         match c {
             Command::Fetch(_)
             | Command::Rate { .. }
@@ -321,13 +338,29 @@ impl Engine {
 
     fn effect(&mut self, fx: Effect) {
         let tx = self.tx.clone();
+        log::debug!("effect {}", head(&fx));
         match fx {
             Effect::Resolve(video_id) => {
                 let fut = self.backend.resolve(video_id.clone());
                 tokio::spawn(async move {
+                    let t = std::time::Instant::now();
+                    log::debug!("resolve start {video_id}");
                     let ev = match fut.await {
-                        Ok(stream) => Event::Resolved { video_id, stream },
-                        Err(message) => Event::ResolveFailed { video_id, message },
+                        Ok(stream) => {
+                            log::debug!(
+                                "resolve end {video_id} ok {}ms {}",
+                                t.elapsed().as_millis(),
+                                url_info(&stream.url)
+                            );
+                            Event::Resolved { video_id, stream }
+                        }
+                        Err(message) => {
+                            log::debug!(
+                                "resolve end {video_id} err {}ms: {message}",
+                                t.elapsed().as_millis()
+                            );
+                            Event::ResolveFailed { video_id, message }
+                        }
                     };
                     let _ = tx.send(Msg::Ev(ev));
                 });
@@ -426,7 +459,22 @@ async fn account(api: &ApiCell, cmd: Command) -> Vec<Update> {
     }
     let (result, ok) = match cmd {
         Command::Fetch(request) => {
+            let t = std::time::Instant::now();
+            log::debug!("fetch start {}", head(&request));
             let result = with_api(api, async |a| a.fetch(&request).await).await;
+            match &result {
+                Ok(p) => log::debug!(
+                    "fetch end {} ok {} items {}ms",
+                    head(&request),
+                    p.items.len(),
+                    t.elapsed().as_millis()
+                ),
+                Err(e) => log::debug!(
+                    "fetch end {} err {}ms: {e}",
+                    head(&request),
+                    t.elapsed().as_millis()
+                ),
+            }
             let mut out = Vec::new();
             if let Err(ApiError::Auth(m)) = &result {
                 out.push(Update::AuthRequired(m.clone()));

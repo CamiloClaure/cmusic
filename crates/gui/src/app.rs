@@ -127,6 +127,8 @@ pub enum Message {
     CloseRequested,
     CycleTheme,
     ReloadTheme,
+    /// Debug script driver (see `main.rs`): advance, or time out the page wait of that id.
+    Demo(Option<u64>),
 }
 
 #[derive(Debug, Default)]
@@ -249,6 +251,7 @@ impl State {
         match msg {
             Message::Engine(u) => return self.engine(u),
             Message::EngineStopped => out.stopped = true,
+            Message::Demo(_) => {}
             Message::SearchInput(s) => self.search = s,
             Message::SearchSubmit => {
                 let q = self.search.trim().to_string();

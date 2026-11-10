@@ -741,4 +741,24 @@ mod tests {
             Err(ApiError::Auth(_))
         ));
     }
+
+    /// Diagnostic for the stored login: `cargo test -p cmusic-core -- --ignored net_account_pages --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn net_account_pages() {
+        let api = Api::new().await;
+        println!("logged_in: {}", api.is_logged_in());
+        for req in [
+            PageRequest::LibraryPlaylists,
+            PageRequest::LibraryArtists,
+            PageRequest::LibrarySongs,
+            PageRequest::LibraryAlbums,
+            PageRequest::LikedSongs,
+        ] {
+            match api.fetch(&req).await {
+                Ok(p) => println!("{req:?}: Ok {} items", p.items.len()),
+                Err(e) => println!("{req:?}: Err {e}"),
+            }
+        }
+    }
 }

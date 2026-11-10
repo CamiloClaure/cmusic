@@ -9,6 +9,8 @@ use cmusic_core::{persist, Update};
 use iced::futures::stream;
 use iced::widget::operation;
 use iced::{event, keyboard, window, Size, Subscription, Task};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -107,22 +109,18 @@ fn subscription(_: &State) -> Subscription<Message> {
     ])
 }
 
-fn update(app: &mut State, mut msg: Message) -> Task<Message> {
-    if let Message::Engine(Update::Page { result: Ok(p), .. }) = &mut msg {
-        if std::env::var_os("CMUSIC_DEMO_ENTRIES").is_some() {
-            p.items
-                .retain(|i| !matches!(i, cmusic_core::Item::Track(_)));
-        }
+fn update(app: &mut State, msg: Message) -> Task<Message> {
+    if let Message::Demo(t) = msg {
+        return demo_step(app, t);
     }
-    let follow = demo_followups(&msg);
-    if let Message::Engine(Update::Page { result, .. }) = &msg {
-        if std::env::var_os("CMUSIC_DEMO_PAGE").is_some() {
-            match result {
-                Ok(p) => eprintln!("page: {} items", p.items.len()),
-                Err(e) => eprintln!("page error: {e}"),
-            }
-        }
-    }
+    // A `waitpage` in progress ends when the next page arrives.
+    let follow = if matches!(msg, Message::Engine(Update::Page { .. }))
+        && WAIT.swap(0, Ordering::Relaxed) != 0
+    {
+        Some(Message::Demo(None))
+    } else {
+        None
+    };
     app.now = std::time::Instant::now();
     let Out {
         commands,
@@ -180,7 +178,7 @@ fn update(app: &mut State, mut msg: Message) -> Task<Message> {
         // Wait for the engine to save and stop, but not forever.
         tasks.push(Task::future(tokio::time::sleep(Duration::from_secs(3))).then(|_| iced::exit()));
     }
-    tasks.extend(follow.into_iter().map(|m| update(app, m)));
+    tasks.extend(follow.map(Task::done));
     Task::batch(tasks)
 }
 
@@ -243,63 +241,129 @@ fn save_prefs(s: Size, theme: &str) {
     );
 }
 
-// Debug harness for screenshots, inert unless these env vars are set:
-//   CMUSIC_DEMO=<query>        search it at startup, then play row 0 when the page arrives
-//   CMUSIC_DEMO_PAGE=liked|playlists|songs|albums|artists  open that sidebar page (no playback)
-//   CMUSIC_DEMO_ENTRIES=1|artist  drop the tracks (or show albums as artists) from the arriving page
-//   CMUSIC_SHOT=<path.png>     after CMUSIC_SHOT_AFTER secs (default 20) save the window, then exit
-//   CMUSIC_DEMO_VIEW=lyrics|login  switch the main area to that view when row 0 starts playing
+// Debug harness, inert unless CMUSIC_DEMO_SCRIPT="step;step;..." is set. Steps run in order:
+//   search:<q>  waitpage (next Page update, max 30 s)  play:<row>  wait:<secs>
+//   seek:<secs>  seekfrac:<0..1>  pause  next  prev  lyrics  login  theme
+//   open:<liked|playlists|songs|albums|artists>  state  shot:<path.png>  quit
+// `seek` goes through SeekChanged then SeekReleased, like a drag. `state` prints one line to stderr.
+static SCRIPT: Mutex<Option<VecDeque<String>>> = Mutex::new(None);
+/// Generation of the `waitpage` in progress, 0 when none.
+static WAIT: AtomicU64 = AtomicU64::new(0);
+
 fn demo_start() -> Task<Message> {
-    let mut t = Task::none();
-    if let Ok(q) = std::env::var("CMUSIC_DEMO") {
-        t = Task::done(Message::SearchInput(q)).chain(Task::done(Message::SearchSubmit));
+    match std::env::var("CMUSIC_DEMO_SCRIPT") {
+        Ok(s) => {
+            let steps = s
+                .split(';')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty());
+            *SCRIPT.lock().unwrap() = Some(steps.collect());
+            Task::done(Message::Demo(None))
+        }
+        Err(_) => Task::none(),
     }
-    if let Ok(p) = std::env::var("CMUSIC_DEMO_PAGE") {
-        use cmusic_core::PageRequest as P;
-        let r = match p.as_str() {
-            "liked" => P::LikedSongs,
-            "playlists" => P::LibraryPlaylists,
-            "songs" => P::LibrarySongs,
-            "albums" => P::LibraryAlbums,
-            _ => P::LibraryArtists,
-        };
-        t = Task::done(Message::Open(r));
+}
+
+/// Handles `Message::Demo`: runs the next step, which hands back to `Demo` when it is done.
+fn demo_step(app: &State, timeout: Option<u64>) -> Task<Message> {
+    use cmusic_core::PageRequest as P;
+    if let Some(g) = timeout {
+        // Only the timer of the wait still in progress may continue the script.
+        if WAIT
+            .compare_exchange(g, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return Task::none();
+        }
+        eprintln!("demo: waitpage timed out");
     }
-    if let Ok(path) = std::env::var("CMUSIC_SHOT") {
-        let secs: u64 = std::env::var("CMUSIC_SHOT_AFTER")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20);
-        let shot = Task::future(tokio::time::sleep(Duration::from_secs(secs)))
-            .then(|_| window::latest())
-            .and_then(window::screenshot)
-            .map(move |s| {
+    let Some(step) = SCRIPT.lock().unwrap().as_mut().and_then(|q| q.pop_front()) else {
+        return Task::none();
+    };
+    let (name, arg) = step.split_once(':').unwrap_or((step.as_str(), ""));
+    let next = || Task::done(Message::Demo(None));
+    let run = |msgs: Vec<Message>| {
+        msgs.into_iter()
+            .fold(Task::none(), |t, m| t.chain(Task::done(m)))
+            .chain(next())
+    };
+    match name {
+        "search" => run(vec![
+            Message::SearchInput(arg.into()),
+            Message::SearchSubmit,
+        ]),
+        "waitpage" => {
+            let g = WAIT.load(Ordering::Relaxed) + 1;
+            WAIT.store(g, Ordering::Relaxed);
+            Task::future(tokio::time::sleep(Duration::from_secs(30)))
+                .map(move |_| Message::Demo(Some(g)))
+        }
+        "play" => run(vec![Message::PlayRow(arg.parse().unwrap_or(0))]),
+        "wait" => Task::future(tokio::time::sleep(Duration::from_secs_f64(
+            arg.parse().unwrap_or(1.0),
+        )))
+        .map(|_| Message::Demo(None)),
+        "seek" | "seekfrac" => {
+            let v: f64 = arg.parse().unwrap_or(0.0);
+            let secs = if name == "seek" {
+                v
+            } else {
+                v * app.snapshot.duration_secs
+            };
+            run(vec![Message::SeekChanged(secs), Message::SeekReleased])
+        }
+        "pause" => run(vec![Message::TogglePause]),
+        "next" => run(vec![Message::Next]),
+        "prev" => run(vec![Message::Prev]),
+        "lyrics" => run(vec![Message::ToggleLyrics]),
+        "login" => run(vec![Message::OpenLogin]),
+        "theme" => run(vec![Message::CycleTheme]),
+        "open" => {
+            let r = match arg {
+                "liked" => P::LikedSongs,
+                "playlists" => P::LibraryPlaylists,
+                "songs" => P::LibrarySongs,
+                "albums" => P::LibraryAlbums,
+                _ => P::LibraryArtists,
+            };
+            run(vec![Message::Open(r)])
+        }
+        "state" => {
+            let view = if app.login.is_some() {
+                "login"
+            } else if app.show_lyrics {
+                "lyrics"
+            } else {
+                "list"
+            };
+            let page = match (&app.failed, &app.current) {
+                (Some((_, e)), _) => format!("error {e}"),
+                (_, Some((_, p))) => format!("{} items", p.items.len()),
+                _ if app.awaiting.is_some() => "loading".into(),
+                _ => "none".into(),
+            };
+            let s = &app.snapshot;
+            eprintln!(
+                "state: status={:?} pos={:.1} dur={:.1} view={view} page={page} logged_in={} notice={:?}",
+                s.status, s.position_secs, s.duration_secs, app.logged_in, app.notice
+            );
+            next()
+        }
+        "shot" => {
+            let path = arg.to_string();
+            window::latest().and_then(window::screenshot).map(move |s| {
                 if let Some(img) =
                     ::image::RgbaImage::from_raw(s.size.width, s.size.height, s.rgba.to_vec())
                 {
                     let _ = img.save(&path);
                 }
-                std::process::exit(0)
-            });
-        t = t.chain(shot);
+                Message::Demo(None)
+            })
+        }
+        "quit" => Task::done(Message::CloseRequested),
+        _ => {
+            eprintln!("demo: unknown step {step:?}");
+            next()
+        }
     }
-    t
-}
-
-/// Once the demo search page lands: play row 0 (and switch view), as the UI would.
-fn demo_followups(msg: &Message) -> Vec<Message> {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !matches!(msg, Message::Engine(Update::Page { .. }))
-        || std::env::var_os("CMUSIC_DEMO").is_none()
-        || DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        return vec![];
-    }
-    let mut v = vec![Message::PlayRow(0)];
-    match std::env::var("CMUSIC_DEMO_VIEW").as_deref() {
-        Ok("lyrics") => v.push(Message::ToggleLyrics),
-        Ok("login") => v.push(Message::OpenLogin),
-        _ => {}
-    }
-    v
 }

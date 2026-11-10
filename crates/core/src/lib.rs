@@ -4,6 +4,7 @@
 pub mod api;
 pub mod auth;
 pub mod engine;
+pub mod logger;
 pub mod lyrics;
 pub mod media;
 pub mod persist;
