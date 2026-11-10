@@ -22,6 +22,8 @@ Cookies are stored in one owner-only file in the config folder.
 ```
 cargo build --release
 ```
+Run the release build: without a GPU driver (WSL, virtual machines) the desktop app renders in software, which is only smooth when optimized.
+
 Needs the libmpv development files (`libmpv-dev` on Debian/Ubuntu, `brew install mpv` on macOS).
 
 ## License

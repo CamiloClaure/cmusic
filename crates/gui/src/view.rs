@@ -444,11 +444,8 @@ fn glass(_: &Theme) -> container::Style {
                 .into(),
         ),
         border: border::rounded(20).color(white(0.22)).width(1),
-        shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
-            offset: Vector::new(0.0, 10.0),
-            blur_radius: 28.0,
-        },
+        // No drop shadow: without a GPU driver iced renders in software, where a large
+        // blurred shadow per panel is the most expensive thing on screen.
         ..Default::default()
     }
 }
