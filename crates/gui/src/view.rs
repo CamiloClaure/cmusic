@@ -5,9 +5,7 @@ use iced::widget::text::Wrapping;
 use iced::widget::{
     button, column, container, image, row, scrollable, slider, space, stack, text, text_input,
 };
-use iced::{
-    border, gradient, Background, Center, Color, ContentFit, Element, Fill, Shadow, Theme, Vector,
-};
+use iced::{border, gradient, Background, Center, Color, ContentFit, Element, Fill, Theme};
 
 /// Rows rendered per list.
 // ponytail: no virtualization; a lazy/windowed list is the upgrade if 500 rows ever feels slow.
@@ -63,12 +61,28 @@ fn line<'a>(l: Look, t: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
     txt(l, t).wrapping(Wrapping::None)
 }
 
+/// Rail width plus the gap an embedded scrollbar takes from its content.
+const RAIL: f32 = 16.0;
+
+/// Shortens `t` to fit `width` px at base text size `base` (iced has no ellipsis), cutting on a
+/// char boundary and ending with "...".
+// ponytail: width is estimated at 0.5 em per char; real text measurement is the upgrade.
+fn fit(l: Look, t: &str, width: f32, base: f32) -> String {
+    let budget = (width / (sz(l, base) * 0.5)).max(4.0) as usize;
+    if t.chars().count() <= budget {
+        return t.to_string();
+    }
+    let head: String = t.chars().take(budget - 3).collect();
+    format!("{}...", head.trim_end())
+}
+
 fn art<'a>(s: &'a State, url: Option<&String>, size: u32) -> Element<'a, Message> {
     let l = s.look;
     match url.and_then(|u| s.art.get(u)) {
         Some(h) => image(h.clone())
             .width(size)
             .height(size)
+            .content_fit(ContentFit::Cover)
             .border_radius(size as f32 / 5.0)
             .into(),
         None => container(space())
@@ -85,12 +99,14 @@ fn art<'a>(s: &'a State, url: Option<&String>, size: u32) -> Element<'a, Message
 
 fn sidebar(s: &State) -> Element<'_, Message> {
     let l = s.look;
+    let open = s.current.as_ref().map(|(r, _)| r);
     let nav = |label: &'static str, r: PageRequest| {
+        let on = open == Some(&r);
         button(txt(l, label))
             .on_press(Message::Open(r))
             .width(Fill)
             .padding([8, 12])
-            .style(row_button(l, false))
+            .style(row_button(l, on))
     };
     column![
         text_input("Search", &s.search)
@@ -105,10 +121,14 @@ fn sidebar(s: &State) -> Element<'_, Message> {
         nav("Albums", PageRequest::LibraryAlbums),
         nav("Artists", PageRequest::LibraryArtists),
         space().height(Fill),
-        button(txt(l, "Log in").center().width(Fill))
-            .on_press(Message::OpenLogin)
-            .width(Fill)
-            .style(pill(l, false)),
+        button(
+            txt(l, if s.logged_in { "Account" } else { "Log in" })
+                .center()
+                .width(Fill)
+        )
+        .on_press(Message::OpenLogin)
+        .width(Fill)
+        .style(pill(l, false)),
     ]
     .spacing(4)
     .width(180)
@@ -139,10 +159,13 @@ fn main_area(s: &State) -> Element<'_, Message> {
     ]
     .align_y(Center);
     let mut rows = column![].spacing(4);
+    // Window minus panels, sidebar, queue, art, duration, three buttons and the gaps between.
+    let avail =
+        (s.size.width - 10.0 * l.gap - 460.0 - 5.0 * l.pad - RAIL - 250.0 * l.font_scale).max(80.0);
     let mut note = None;
     if let Some((_, page)) = &s.current {
         for (i, it) in page.items.iter().enumerate().take(MAX_ROWS) {
-            rows = rows.push(item_row(s, i, it));
+            rows = rows.push(item_row(s, i, it, avail));
         }
         if page.items.len() > MAX_ROWS {
             note = Some(format!("showing {MAX_ROWS} of {}", page.items.len()));
@@ -151,6 +174,7 @@ fn main_area(s: &State) -> Element<'_, Message> {
     column![
         header,
         scrollable(rows.padding([0.0, l.pad]))
+            .spacing(6)
             .style(scroll(l))
             .height(Fill)
             .width(Fill),
@@ -161,7 +185,7 @@ fn main_area(s: &State) -> Element<'_, Message> {
     .into()
 }
 
-fn item_row<'a>(s: &'a State, i: usize, it: &'a Item) -> Element<'a, Message> {
+fn item_row<'a>(s: &'a State, i: usize, it: &'a Item, w: f32) -> Element<'a, Message> {
     let l = s.look;
     let (title, sub, open): (&str, &str, Option<PageRequest>) = match it {
         Item::Track(t) => (&t.title, &t.artists, None),
@@ -182,8 +206,10 @@ fn item_row<'a>(s: &'a State, i: usize, it: &'a Item) -> Element<'a, Message> {
         ),
     };
     let label = button(column![
-        line(l, title),
-        line(l, sub).size(sz(l, 13.0)).style(text::secondary)
+        line(l, fit(l, title, w, 16.0)),
+        line(l, fit(l, sub, w, 13.0))
+            .size(sz(l, 13.0))
+            .color(l.text_dim)
     ])
     .on_press(open.map_or(Message::PlayRow(i), Message::Open))
     .width(Fill)
@@ -231,6 +257,7 @@ fn lyrics_view(s: &State) -> Element<'_, Message> {
             }
             // ponytail: no auto-scroll to the current line; add scrollable::scroll_to if wanted.
             scrollable(c.padding(l.pad))
+                .spacing(6)
                 .style(scroll(l))
                 .height(Fill)
                 .width(Fill)
@@ -282,24 +309,38 @@ fn queue(s: &State) -> Element<'_, Message> {
     let l = s.look;
     let snap = &s.snapshot;
     let mut c = column![].spacing(2);
+    // Queue column minus the remove button, the row button padding and the rail.
+    let w = 280.0 - 28.0 - 10.0 - RAIL;
     for (i, t) in snap.queue.iter().enumerate().take(MAX_ROWS) {
         let cur = snap.cursor == Some(i);
         let name = button(column![
-            line(l, &t.title),
-            line(l, &t.artists).size(sz(l, 12.0))
+            line(l, fit(l, &t.title, w, 16.0)),
+            line(l, fit(l, &t.artists, w, 12.0)).size(sz(l, 12.0))
         ])
         .on_press(Message::Jump(i))
         .width(Fill)
         .clip(true)
-        .style(row_button(l, cur));
+        .style(row_button(l, false));
+        let x = button(txt(l, "x").center())
+            .on_press(Message::Remove(i))
+            .width(28)
+            .height(28)
+            .padding(0)
+            .style(row_button(l, false));
         c = c.push(
-            row![
-                name,
-                button(txt(l, "x"))
-                    .on_press(Message::Remove(i))
-                    .style(row_button(l, false))
-            ]
-            .align_y(Center),
+            container(row![name, x].align_y(Center))
+                .width(Fill)
+                .style(move |_| container::Style {
+                    background: cur.then(|| tint(l.control, 0.14 + l.control.a).into()),
+                    border: border::rounded(l.radius_row)
+                        .color(if cur {
+                            tint(l.accent_a, 0.7)
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .width(1),
+                    ..Default::default()
+                }),
         );
     }
     column![
@@ -310,7 +351,11 @@ fn queue(s: &State) -> Element<'_, Message> {
                 .style(pill(l, false)),
         ]
         .align_y(Center),
-        scrollable(c).style(scroll(l)).height(Fill).width(Fill),
+        scrollable(c)
+            .spacing(6)
+            .style(scroll(l))
+            .height(Fill)
+            .width(Fill),
     ]
     .spacing(l.pad)
     .width(280)
@@ -328,17 +373,30 @@ fn bar(s: &State) -> Element<'_, Message> {
         _ => "",
     };
     let info = column![
-        line(l, cur.map_or("Nothing playing", |t| t.title.as_str())),
         line(
             l,
-            match (status, cur) {
-                ("", Some(t)) => t.artists.as_str(),
-                ("", None) => "",
-                (st, _) => st,
-            }
+            fit(
+                l,
+                cur.map_or("Nothing playing", |t| t.title.as_str()),
+                220.0,
+                16.0
+            )
+        ),
+        line(
+            l,
+            fit(
+                l,
+                match (status, cur) {
+                    ("", Some(t)) => t.artists.as_str(),
+                    ("", None) => "",
+                    (st, _) => st,
+                },
+                220.0,
+                13.0
+            )
         )
         .size(sz(l, 13.0))
-        .style(text::secondary),
+        .color(l.text_dim),
     ];
     let info = container(info).width(220).clip(true);
     let playing = matches!(snap.status, Status::Playing | Status::Buffering);
@@ -400,7 +458,7 @@ fn controls(s: &State) -> Element<'_, Message> {
                 .unwrap_or("")
         )
         .size(sz(l, 13.0))
-        .style(text::secondary)
+        .color(l.text_dim)
         .width(Fill),
         text("Vol").size(sz(l, 13.0)),
         slider(0..=100u8, snap.volume, Message::Volume)
@@ -535,15 +593,6 @@ fn pill(l: Look, on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
                     tint(l.control_border, l.control_border.a + lift)
                 })
                 .width(1),
-            shadow: if on {
-                Shadow {
-                    color: tint(l.accent_a, 0.35 + lift),
-                    offset: Vector::ZERO,
-                    blur_radius: 16.0,
-                }
-            } else {
-                Shadow::default()
-            },
             ..Default::default()
         }
     }
@@ -576,12 +625,13 @@ fn field(l: Look) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
     move |_, status| {
         let focused = matches!(status, text_input::Status::Focused { .. });
         text_input::Style {
-            background: tint(l.control, if focused { 0.14 } else { 0.08 }).into(),
+            // An input: darker than the rows around it, with a clear edge.
+            background: tint(l.ink, if focused { 0.45 } else { 0.35 }).into(),
             border: border::rounded(999)
                 .color(if focused {
                     l.accent_a
                 } else {
-                    l.control_border
+                    tint(l.text, 0.4)
                 })
                 .width(1),
             icon: tint(l.text, 0.6),
@@ -628,5 +678,27 @@ fn scroll(l: Look) -> impl Fn(&Theme, scrollable::Status) -> scrollable::Style {
         st.vertical_rail = rail;
         st.horizontal_rail = rail;
         st
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_cuts_on_char_boundaries() {
+        let l = Look::default();
+        // 96 px at 16 px text is a 12 char budget.
+        assert_eq!(fit(l, "short", 96.0, 16.0), "short");
+        assert_eq!(fit(l, "123456789012", 96.0, 16.0), "123456789012");
+        assert_eq!(fit(l, "1234567890123", 96.0, 16.0), "123456789...");
+        let jp = "ñandú canción mañana".to_string();
+        let out = fit(l, &jp, 96.0, 16.0);
+        assert_eq!(out.chars().count(), 12);
+        assert!(out.ends_with("..."));
+        assert_eq!(
+            fit(l, "日本語日本語日本語日本語日本語", 96.0, 16.0),
+            "日本語日本語日本語..."
+        );
     }
 }

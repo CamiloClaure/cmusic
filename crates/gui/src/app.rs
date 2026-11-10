@@ -100,6 +100,8 @@ pub struct State {
     pub show_lyrics: bool,
     pub login: Option<Login>,
     pub notice: Option<String>,
+    /// Set at startup from the cookie file, then by the "Logged in" notice and `AuthRequired`.
+    pub logged_in: bool,
     /// Local slider value while the seek slider is being dragged.
     pub drag: Option<f64>,
     pub art: HashMap<String, image::Handle>,
@@ -124,6 +126,7 @@ impl State {
             show_lyrics: false,
             login: None,
             notice: None,
+            logged_in: false,
             drag: None,
             art: HashMap::new(),
             backdrop: None,
@@ -293,12 +296,14 @@ impl State {
             }
             Update::Lyrics { video_id, lyrics } => self.lyrics = Some((video_id, lyrics)),
             Update::AuthRequired(m) => {
+                self.logged_in = false;
                 let l = self.login.get_or_insert_with(Login::default);
                 l.message = Some(m);
             }
             Update::Notice(n) => {
                 if n == "Logged in" {
                     self.login = None;
+                    self.logged_in = true;
                 }
                 self.notice = Some(n);
             }
@@ -487,8 +492,12 @@ mod tests {
             s.login.as_ref().unwrap().message.as_deref(),
             Some("expired")
         );
+        s.logged_in = true;
+        s.update(Message::Engine(Update::AuthRequired("expired".into())));
+        assert!(!s.logged_in);
         s.update(Message::Engine(Update::Notice("Logged in".into())));
         assert!(s.login.is_none());
+        assert!(s.logged_in);
     }
 
     #[test]

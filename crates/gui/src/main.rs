@@ -41,7 +41,8 @@ fn main() -> iced::Result {
         s.look = look;
         s.theme_name = theme_name.clone();
         s.notice = notice.clone();
-        (s, Task::none())
+        s.logged_in = cmusic_core::auth::logged_in();
+        (s, demo_start())
     };
     iced::application(init, update, view::view)
         .title("cmusic")
@@ -89,6 +90,7 @@ fn subscription(_: &State) -> Subscription<Message> {
 }
 
 fn update(app: &mut State, msg: Message) -> Task<Message> {
+    let follow = demo_followups(&msg);
     let Out {
         commands,
         art,
@@ -117,6 +119,7 @@ fn update(app: &mut State, msg: Message) -> Task<Message> {
         // Wait for the engine to save and stop, but not forever.
         tasks.push(Task::future(tokio::time::sleep(Duration::from_secs(3))).then(|_| iced::exit()));
     }
+    tasks.extend(follow.into_iter().map(|m| update(app, m)));
     Task::batch(tasks)
 }
 
@@ -175,4 +178,52 @@ fn save_prefs(s: Size, theme: &str) {
         prefs_path(),
         serde_json::json!({"w": s.width, "h": s.height, "theme": theme}).to_string(),
     );
+}
+
+// Debug harness for screenshots, inert unless these env vars are set:
+//   CMUSIC_DEMO=<query>        search it at startup, then play row 0 when the page arrives
+//   CMUSIC_SHOT=<path.png>     after CMUSIC_SHOT_AFTER secs (default 20) save the window, then exit
+//   CMUSIC_DEMO_VIEW=lyrics|login  switch the main area to that view when row 0 starts playing
+fn demo_start() -> Task<Message> {
+    let mut t = Task::none();
+    if let Ok(q) = std::env::var("CMUSIC_DEMO") {
+        t = Task::done(Message::SearchInput(q)).chain(Task::done(Message::SearchSubmit));
+    }
+    if let Ok(path) = std::env::var("CMUSIC_SHOT") {
+        let secs = std::env::var("CMUSIC_SHOT_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let shot = Task::future(tokio::time::sleep(Duration::from_secs(secs)))
+            .then(|_| window::latest())
+            .and_then(window::screenshot)
+            .map(move |s| {
+                if let Some(img) =
+                    ::image::RgbaImage::from_raw(s.size.width, s.size.height, s.rgba.to_vec())
+                {
+                    let _ = img.save(&path);
+                }
+                std::process::exit(0)
+            });
+        t = t.chain(shot);
+    }
+    t
+}
+
+/// Once the demo search page lands: play row 0 (and switch view), as the UI would.
+fn demo_followups(msg: &Message) -> Vec<Message> {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !matches!(msg, Message::Engine(Update::Page { .. }))
+        || std::env::var_os("CMUSIC_DEMO").is_none()
+        || DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return vec![];
+    }
+    let mut v = vec![Message::PlayRow(0)];
+    match std::env::var("CMUSIC_DEMO_VIEW").as_deref() {
+        Ok("lyrics") => v.push(Message::ToggleLyrics),
+        Ok("login") => v.push(Message::OpenLogin),
+        _ => {}
+    }
+    v
 }
