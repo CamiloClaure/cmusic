@@ -1,4 +1,5 @@
 mod app;
+mod theme;
 mod view;
 
 use app::{Message, Out, State};
@@ -30,10 +31,21 @@ fn main() -> iced::Result {
             std::process::exit(1);
         }
     }
-    let size = load_size();
-    iced::application(move || (State::new(size), Task::none()), update, view::view)
+    let (size, saved) = load_prefs();
+    let (look, theme_name, notice) = match theme::load(&saved) {
+        Ok(l) => (l, saved, None),
+        Err(e) => (theme::Look::default(), theme::DEFAULT.to_string(), Some(e)),
+    };
+    let init = move || {
+        let mut s = State::new(size);
+        s.look = look;
+        s.theme_name = theme_name.clone();
+        s.notice = notice.clone();
+        (s, Task::none())
+    };
+    iced::application(init, update, view::view)
         .title("cmusic")
-        .theme(|_: &State| view::theme())
+        .theme(|s: &State| view::theme(s.look))
         .subscription(subscription)
         .window(window::Settings {
             size,
@@ -64,6 +76,11 @@ fn subscription(_: &State) -> Subscription<Message> {
                 key: keyboard::Key::Named(keyboard::key::Named::Space),
                 ..
             }) if status == event::Status::Ignored => Some(Message::TogglePause),
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(c),
+                modifiers,
+                ..
+            }) if modifiers.control() && c.as_str() == "r" => Some(Message::ReloadTheme),
             _ => None,
         }),
         window::resize_events().map(|(_, s)| Message::Resized(s)),
@@ -84,7 +101,7 @@ fn update(app: &mut State, msg: Message) -> Task<Message> {
         }
     }
     if stopped {
-        save_size(app.size);
+        save_prefs(app.size, &app.theme_name);
         return iced::exit();
     }
     let mut tasks: Vec<Task<Message>> = art
@@ -96,7 +113,7 @@ fn update(app: &mut State, msg: Message) -> Task<Message> {
         })
         .collect();
     if closing {
-        save_size(app.size);
+        save_prefs(app.size, &app.theme_name);
         // Wait for the engine to save and stop, but not forever.
         tasks.push(Task::future(tokio::time::sleep(Duration::from_secs(3))).then(|_| iced::exit()));
     }
@@ -132,24 +149,30 @@ async fn fetch_art(url: String) -> Option<Vec<u8>> {
     Some(bytes.to_vec())
 }
 
-fn size_path() -> std::path::PathBuf {
+fn prefs_path() -> std::path::PathBuf {
     persist::state_path().with_file_name("gui.json")
 }
 
-fn load_size() -> Size {
-    let v: Option<serde_json::Value> = std::fs::read_to_string(size_path())
+/// Window size and theme name; a missing file or key gives the defaults.
+fn load_prefs() -> (Size, String) {
+    let v: Option<serde_json::Value> = std::fs::read_to_string(prefs_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok());
     let get = |k: &str| v.as_ref()?.get(k)?.as_f64();
-    match (get("w"), get("h")) {
+    let size = match (get("w"), get("h")) {
         (Some(w), Some(h)) if w >= 800.0 && h >= 500.0 => Size::new(w as f32, h as f32),
         _ => DEFAULT_SIZE,
-    }
+    };
+    let theme = v
+        .as_ref()
+        .and_then(|v| v.get("theme")?.as_str())
+        .unwrap_or(theme::DEFAULT);
+    (size, theme.to_string())
 }
 
-fn save_size(s: Size) {
+fn save_prefs(s: Size, theme: &str) {
     let _ = std::fs::write(
-        size_path(),
-        serde_json::json!({"w": s.width, "h": s.height}).to_string(),
+        prefs_path(),
+        serde_json::json!({"w": s.width, "h": s.height, "theme": theme}).to_string(),
     );
 }

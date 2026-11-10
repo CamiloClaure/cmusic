@@ -26,5 +26,29 @@ Run the release build: without a GPU driver (WSL, virtual machines) the desktop 
 
 Needs the libmpv development files (`libmpv-dev` on Debian/Ubuntu, `brew install mpv` on macOS).
 
+## Themes
+The desktop app reads user themes from `themes/<name>.json` in the config folder (`~/.config/cmusic/themes/` on Linux). Copy a preset from `themes/` in this repo to start. A file may hold only the keys it changes; unknown keys or bad values are reported in the status line and the previous look stays.
+
+Press the `Theme: <name>` button next to "Lyrics" to cycle (Default, then each file by name), and `Ctrl+R` to re-read the current file after editing. The choice is remembered. Numbers are clamped to the range shown.
+
+Colours are `"#rrggbb"` or `"#rrggbbaa"`.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `accent_a`, `accent_b` | colour | Accent gradient start and end (equal = flat accent) |
+| `ink` | colour | Window background and text on accent fills |
+| `text`, `text_dim` | colour | Main text; times and dimmed lyrics |
+| `panel_top`, `panel_mid`, `panel_bottom` | colour | Panel fill at the top edge, at 12 % height, at the bottom (equal = flat panel) |
+| `panel_border` | colour | Panel outline and scrollbar thumb |
+| `control`, `control_border` | colour | Idle buttons and search field fill and outline (alpha is the base for hover) |
+| `scrim_top`, `scrim_bottom` | colour | Dimming layer over the backdrop |
+| `base` | 3 colours | Gradient behind the backdrop, or alone when it is off |
+| `radius_panel`, `radius_row` | number 0-40 | Corner radius of panels and list rows |
+| `gap`, `pad` | number 0-40 | Space between and inside panels; space between items |
+| `font_scale` | number 0.6-2 | Multiplier for every text size |
+| `backdrop` | true/false | Blurred album art behind the UI (false is cheapest to render) |
+| `backdrop_blur` | number 0-30 | Blur radius of the backdrop |
+| `backdrop_saturation` | number 0-4 | Colour boost of the backdrop |
+
 ## License
 GPL-3.0-only

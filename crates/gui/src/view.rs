@@ -1,4 +1,5 @@
 use crate::app::{thumb, Message, State};
+use crate::theme::Look;
 use cmusic_core::{lyrics, Item, PageRequest, Repeat, Status, Track};
 use iced::widget::text::Wrapping;
 use iced::widget::{
@@ -11,47 +12,59 @@ use iced::{
 /// Rows rendered per list.
 // ponytail: no virtualization; a lazy/windowed list is the upgrade if 500 rows ever feels slow.
 const MAX_ROWS: usize = 500;
-const PAD: f32 = 8.0;
-const GAP: f32 = 14.0;
 
 pub fn view(s: &State) -> Element<'_, Message> {
+    let l = s.look;
     let content = column![
         row![
-            panel(sidebar(s)),
-            panel(main_area(s)).width(Fill),
-            panel(queue(s))
+            panel(l, sidebar(s)),
+            panel(l, main_area(s)).width(Fill),
+            panel(l, queue(s))
         ]
-        .spacing(GAP)
+        .spacing(l.gap)
         .height(Fill),
-        panel(column![bar(s), controls(s)].spacing(PAD)),
+        panel(l, column![bar(s), controls(s)].spacing(l.pad)),
     ]
-    .spacing(GAP)
-    .padding(GAP);
+    .spacing(l.gap)
+    .padding(l.gap);
     // Glass needs something to sit on: the blurred art of the current track, dimmed by a scrim.
     let backdrop: Element<_> = match &s.backdrop {
-        Some((_, h)) => image(h.clone())
+        Some((_, h)) if l.backdrop => image(h.clone())
             .content_fit(ContentFit::Cover)
             .width(Fill)
             .height(Fill)
             .into(),
-        None => space().into(),
+        _ => space().into(),
     };
     stack![
-        container(backdrop).width(Fill).height(Fill).style(base),
-        container(content).width(Fill).height(Fill).style(scrim),
+        container(backdrop).width(Fill).height(Fill).style(base(l)),
+        container(content).width(Fill).height(Fill).style(scrim(l)),
     ]
     .into()
 }
 
-fn panel<'a>(content: impl Into<Element<'a, Message>>) -> iced::widget::Container<'a, Message> {
-    container(content).padding(14).style(glass)
+fn panel<'a>(
+    l: Look,
+    content: impl Into<Element<'a, Message>>,
+) -> iced::widget::Container<'a, Message> {
+    container(content).padding(l.gap).style(glass(l))
 }
 
-fn line<'a>(t: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
-    text(t).wrapping(Wrapping::None)
+/// Every text size goes through here (16 is iced's default text size).
+fn sz(l: Look, n: f32) -> f32 {
+    n * l.font_scale
+}
+
+fn txt<'a>(l: Look, t: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
+    text(t).size(sz(l, 16.0))
+}
+
+fn line<'a>(l: Look, t: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
+    txt(l, t).wrapping(Wrapping::None)
 }
 
 fn art<'a>(s: &'a State, url: Option<&String>, size: u32) -> Element<'a, Message> {
+    let l = s.look;
     match url.and_then(|u| s.art.get(u)) {
         Some(h) => image(h.clone())
             .width(size)
@@ -61,8 +74,8 @@ fn art<'a>(s: &'a State, url: Option<&String>, size: u32) -> Element<'a, Message
         None => container(space())
             .width(size)
             .height(size)
-            .style(|_| container::Style {
-                background: Some(white(0.08).into()),
+            .style(move |_| container::Style {
+                background: Some(tint(l.control, 0.08).into()),
                 border: border::rounded(8),
                 ..Default::default()
             })
@@ -71,29 +84,31 @@ fn art<'a>(s: &'a State, url: Option<&String>, size: u32) -> Element<'a, Message
 }
 
 fn sidebar(s: &State) -> Element<'_, Message> {
+    let l = s.look;
     let nav = |label: &'static str, r: PageRequest| {
-        button(label)
+        button(txt(l, label))
             .on_press(Message::Open(r))
             .width(Fill)
             .padding([8, 12])
-            .style(row_button(false))
+            .style(row_button(l, false))
     };
     column![
         text_input("Search", &s.search)
             .on_input(Message::SearchInput)
             .on_submit(Message::SearchSubmit)
             .padding([8, 14])
-            .style(field),
+            .size(sz(l, 16.0))
+            .style(field(l)),
         nav("Liked songs", PageRequest::LikedSongs),
         nav("Playlists", PageRequest::LibraryPlaylists),
         nav("Songs", PageRequest::LibrarySongs),
         nav("Albums", PageRequest::LibraryAlbums),
         nav("Artists", PageRequest::LibraryArtists),
         space().height(Fill),
-        button(text("Log in").center().width(Fill))
+        button(txt(l, "Log in").center().width(Fill))
             .on_press(Message::OpenLogin)
             .width(Fill)
-            .style(pill(false)),
+            .style(pill(l, false)),
     ]
     .spacing(4)
     .width(180)
@@ -101,6 +116,7 @@ fn sidebar(s: &State) -> Element<'_, Message> {
 }
 
 fn main_area(s: &State) -> Element<'_, Message> {
+    let l = s.look;
     if s.login.is_some() {
         return login(s);
     }
@@ -113,10 +129,13 @@ fn main_area(s: &State) -> Element<'_, Message> {
         (None, None) => "Search or pick something on the left".to_string(),
     };
     let header = row![
-        text(title).size(22).wrapping(Wrapping::None).width(Fill),
-        button("Back")
+        text(title)
+            .size(sz(l, 22.0))
+            .wrapping(Wrapping::None)
+            .width(Fill),
+        button(txt(l, "Back"))
             .on_press_maybe((!s.history.is_empty()).then_some(Message::Back))
-            .style(pill(false)),
+            .style(pill(l, false)),
     ]
     .align_y(Center);
     let mut rows = column![].spacing(4);
@@ -131,18 +150,19 @@ fn main_area(s: &State) -> Element<'_, Message> {
     }
     column![
         header,
-        scrollable(rows.padding([0.0, PAD]))
-            .style(scroll)
+        scrollable(rows.padding([0.0, l.pad]))
+            .style(scroll(l))
             .height(Fill)
             .width(Fill),
-        text(note.unwrap_or_default()).size(13)
+        text(note.unwrap_or_default()).size(sz(l, 13.0))
     ]
-    .spacing(PAD)
+    .spacing(l.pad)
     .width(Fill)
     .into()
 }
 
 fn item_row<'a>(s: &'a State, i: usize, it: &'a Item) -> Element<'a, Message> {
+    let l = s.look;
     let (title, sub, open): (&str, &str, Option<PageRequest>) = match it {
         Item::Track(t) => (&t.title, &t.artists, None),
         Item::Playlist(e) => (
@@ -162,128 +182,143 @@ fn item_row<'a>(s: &'a State, i: usize, it: &'a Item) -> Element<'a, Message> {
         ),
     };
     let label = button(column![
-        line(title),
-        line(sub).size(13).style(text::secondary)
+        line(l, title),
+        line(l, sub).size(sz(l, 13.0)).style(text::secondary)
     ])
     .on_press(open.map_or(Message::PlayRow(i), Message::Open))
     .width(Fill)
     .clip(true)
-    .style(row_button(false));
+    .style(row_button(l, false));
     let mut r = row![art(s, thumb(it).as_ref(), 40), label]
-        .spacing(PAD)
+        .spacing(l.pad)
         .align_y(Center);
     if let Item::Track(t) = it {
-        r = r.push(line(t.duration_secs.map(|d| mmss(d as f64)).unwrap_or_default()).width(48));
-        r = r.push(small("Next", Message::PlayNext(t.clone())));
-        r = r.push(small("Add", Message::Enqueue(t.clone())));
-        r = r.push(small("Like", Message::Like(t.video_id.clone())));
+        r = r.push(
+            line(
+                l,
+                t.duration_secs.map(|d| mmss(d as f64)).unwrap_or_default(),
+            )
+            .width(48),
+        );
+        r = r.push(small(l, "Next", Message::PlayNext(t.clone())));
+        r = r.push(small(l, "Add", Message::Enqueue(t.clone())));
+        r = r.push(small(l, "Like", Message::Like(t.video_id.clone())));
     }
     r.into()
 }
 
-fn small(label: &'static str, m: Message) -> Element<'static, Message> {
-    button(text(label).size(13))
+fn small(l: Look, label: &'static str, m: Message) -> Element<'static, Message> {
+    button(text(label).size(sz(l, 13.0)))
         .on_press(m)
         .padding([4, 10])
-        .style(pill(false))
+        .style(pill(l, false))
         .into()
 }
 
 fn lyrics_view(s: &State) -> Element<'_, Message> {
+    let l = s.look;
     let body: Element<_> = match s.current_lyrics() {
-        Some(l) if !l.lines.is_empty() => {
-            let cur = lyrics::current_line(l, s.snapshot.position_secs);
+        Some(ly) if !ly.lines.is_empty() => {
+            let cur = lyrics::current_line(ly, s.snapshot.position_secs);
             let mut c = column![].spacing(6);
-            for (i, (_, t)) in l.lines.iter().enumerate() {
-                let t = text(t.as_str()).size(18);
+            for (i, (_, t)) in ly.lines.iter().enumerate() {
+                let t = text(t.as_str()).size(sz(l, 18.0));
                 c = c.push(if Some(i) == cur {
-                    t.size(21).color(Color::WHITE)
+                    t.size(sz(l, 21.0)).color(tint(l.text, 1.0))
                 } else {
-                    t.color(white(0.45))
+                    t.color(tint(l.text_dim, 0.45))
                 });
             }
             // ponytail: no auto-scroll to the current line; add scrollable::scroll_to if wanted.
-            scrollable(c.padding(PAD))
-                .style(scroll)
+            scrollable(c.padding(l.pad))
+                .style(scroll(l))
                 .height(Fill)
                 .width(Fill)
                 .into()
         }
-        _ => text("No lyrics").into(),
+        _ => txt(l, "No lyrics").into(),
     };
-    column![text("Lyrics").size(22), body]
-        .spacing(PAD)
+    column![text("Lyrics").size(sz(l, 22.0)), body]
+        .spacing(l.pad)
         .width(Fill)
         .into()
 }
 
 fn login(s: &State) -> Element<'_, Message> {
-    let l = s.login.as_ref().expect("checked by caller");
+    let l = s.look;
+    let lg = s.login.as_ref().expect("checked by caller");
     column![
-        text("Log in").size(22),
-        text(
-            l.message
+        text("Log in").size(sz(l, 22.0)),
+        txt(
+            l,
+            lg.message
                 .as_deref()
                 .unwrap_or("Import your YouTube Music cookies.")
         ),
-        button("Import from browser")
+        button(txt(l, "Import from browser"))
             .on_press(Message::ImportBrowsers)
-            .style(pill(true)),
-        text("Or paste a Cookie header:"),
-        text_input("Cookie: ...", &l.cookie)
+            .style(pill(l, true)),
+        txt(l, "Or paste a Cookie header:"),
+        text_input("Cookie: ...", &lg.cookie)
             .secure(true)
             .on_input(Message::CookieInput)
             .on_submit(Message::UseCookie)
             .padding([8, 14])
-            .style(field),
-        button("Use pasted cookie")
+            .size(sz(l, 16.0))
+            .style(field(l)),
+        button(txt(l, "Use pasted cookie"))
             .on_press(Message::UseCookie)
-            .style(pill(false)),
-        button("Close")
+            .style(pill(l, false)),
+        button(txt(l, "Close"))
             .on_press(Message::CloseLogin)
-            .style(pill(false)),
+            .style(pill(l, false)),
     ]
-    .spacing(PAD)
+    .spacing(l.pad)
     .width(Fill)
     .into()
 }
 
 fn queue(s: &State) -> Element<'_, Message> {
+    let l = s.look;
     let snap = &s.snapshot;
     let mut c = column![].spacing(2);
     for (i, t) in snap.queue.iter().enumerate().take(MAX_ROWS) {
         let cur = snap.cursor == Some(i);
-        let name = button(column![line(&t.title), line(&t.artists).size(12)])
-            .on_press(Message::Jump(i))
-            .width(Fill)
-            .clip(true)
-            .style(row_button(cur));
+        let name = button(column![
+            line(l, &t.title),
+            line(l, &t.artists).size(sz(l, 12.0))
+        ])
+        .on_press(Message::Jump(i))
+        .width(Fill)
+        .clip(true)
+        .style(row_button(l, cur));
         c = c.push(
             row![
                 name,
-                button("x")
+                button(txt(l, "x"))
                     .on_press(Message::Remove(i))
-                    .style(row_button(false))
+                    .style(row_button(l, false))
             ]
             .align_y(Center),
         );
     }
     column![
         row![
-            text("Queue").size(22).width(Fill),
-            button("Clear")
+            text("Queue").size(sz(l, 22.0)).width(Fill),
+            button(txt(l, "Clear"))
                 .on_press_maybe((!snap.queue.is_empty()).then_some(Message::ClearQueue))
-                .style(pill(false)),
+                .style(pill(l, false)),
         ]
         .align_y(Center),
-        scrollable(c).style(scroll).height(Fill).width(Fill),
+        scrollable(c).style(scroll(l)).height(Fill).width(Fill),
     ]
-    .spacing(PAD)
+    .spacing(l.pad)
     .width(280)
     .into()
 }
 
 fn bar(s: &State) -> Element<'_, Message> {
+    let l = s.look;
     let snap = &s.snapshot;
     let cur: Option<&Track> = snap.current();
     let status = match snap.status {
@@ -293,13 +328,16 @@ fn bar(s: &State) -> Element<'_, Message> {
         _ => "",
     };
     let info = column![
-        line(cur.map_or("Nothing playing", |t| t.title.as_str())),
-        line(match (status, cur) {
-            ("", Some(t)) => t.artists.as_str(),
-            ("", None) => "",
-            (st, _) => st,
-        })
-        .size(13)
+        line(l, cur.map_or("Nothing playing", |t| t.title.as_str())),
+        line(
+            l,
+            match (status, cur) {
+                ("", Some(t)) => t.artists.as_str(),
+                ("", None) => "",
+                (st, _) => st,
+            }
+        )
+        .size(sz(l, 13.0))
         .style(text::secondary),
     ];
     let info = container(info).width(220).clip(true);
@@ -309,37 +347,44 @@ fn bar(s: &State) -> Element<'_, Message> {
     row![
         art(s, cur.and_then(|t| t.thumbnail_url.as_ref()), 48),
         info,
-        button("Prev").on_press(Message::Prev).style(pill(false)),
+        button(txt(l, "Prev"))
+            .on_press(Message::Prev)
+            .style(pill(l, false)),
         button(
-            text(if playing { "Pause" } else { "Play" })
+            txt(l, if playing { "Pause" } else { "Play" })
                 .center()
                 .width(Fill)
         )
         .on_press(Message::TogglePause)
         .width(84)
         .padding([9, 0])
-        .style(pill(true)),
-        button("Next").on_press(Message::Next).style(pill(false)),
-        text(mmss(pos)).size(13).color(white(0.7)),
+        .style(pill(l, true)),
+        button(txt(l, "Next"))
+            .on_press(Message::Next)
+            .style(pill(l, false)),
+        text(mmss(pos)).size(sz(l, 13.0)).color(l.text_dim),
         slider(0.0..=max, pos, Message::SeekChanged)
             .on_release(Message::SeekReleased)
             .width(Fill)
-            .style(rail),
-        text(mmss(snap.duration_secs)).size(13).color(white(0.7)),
+            .style(rail(l)),
+        text(mmss(snap.duration_secs))
+            .size(sz(l, 13.0))
+            .color(l.text_dim),
     ]
-    .spacing(PAD)
+    .spacing(l.pad)
     .align_y(Center)
     .into()
 }
 
 /// Second bar row: status line on the left, volume and toggles on the right.
 fn controls(s: &State) -> Element<'_, Message> {
+    let l = s.look;
     let snap = &s.snapshot;
     let on = |label: String, active: bool, m: Message| {
-        button(text(label).size(13))
+        button(text(label).size(sz(l, 13.0)))
             .on_press(m)
             .padding([4, 10])
-            .style(pill(active))
+            .style(pill(l, active))
     };
     let repeat = match snap.repeat {
         Repeat::Off => "Repeat: off",
@@ -348,24 +393,30 @@ fn controls(s: &State) -> Element<'_, Message> {
     };
     row![
         line(
+            l,
             s.notice
                 .as_deref()
                 .or(snap.last_error.as_deref())
                 .unwrap_or("")
         )
-        .size(13)
+        .size(sz(l, 13.0))
         .style(text::secondary)
         .width(Fill),
-        text("Vol").size(13),
+        text("Vol").size(sz(l, 13.0)),
         slider(0..=100u8, snap.volume, Message::Volume)
             .width(100)
-            .style(rail),
+            .style(rail(l)),
         on("Shuffle".into(), snap.shuffle, Message::Shuffle),
         on(repeat.into(), snap.repeat != Repeat::Off, Message::Repeat),
         on("Normalize".into(), snap.normalize, Message::Normalize),
         on("Lyrics".into(), s.show_lyrics, Message::ToggleLyrics),
+        on(
+            format!("Theme: {}", s.theme_name),
+            false,
+            Message::CycleTheme
+        ),
     ]
-    .spacing(PAD)
+    .spacing(l.pad)
     .align_y(Center)
     .into()
 }
@@ -378,72 +429,79 @@ fn mmss(secs: f64) -> String {
 // Look: frosted glass over a blurred backdrop. iced has no backdrop filter, so the blur
 // lives in the backdrop image and the panels are translucent sheets with a light edge.
 
-const ACCENT_A: Color = Color::from_rgb(0.49, 0.91, 1.0);
-const ACCENT_B: Color = Color::from_rgb(0.65, 0.55, 0.98);
-const INK: Color = Color::from_rgb(0.04, 0.06, 0.12);
-
-fn white(a: f32) -> Color {
-    Color::from_rgba(1.0, 1.0, 1.0, a)
+/// `c` with its alpha replaced.
+fn tint(c: Color, a: f32) -> Color {
+    Color { a, ..c }
 }
 
-fn accent() -> Background {
-    gradient::Linear::new(std::f32::consts::FRAC_PI_2)
-        .add_stop(0.0, ACCENT_A)
-        .add_stop(1.0, ACCENT_B)
-        .into()
+/// A gradient, or a plain fill when every stop is the same colour (cheaper to render).
+fn fill(angle: f32, stops: &[(f32, Color)]) -> Background {
+    if stops.windows(2).all(|w| w[0].1 == w[1].1) {
+        return stops[0].1.into();
+    }
+    let mut g = gradient::Linear::new(angle);
+    for &(at, c) in stops {
+        g = g.add_stop(at, c);
+    }
+    g.into()
 }
 
-pub fn theme() -> Theme {
+fn accent(l: Look) -> Background {
+    fill(
+        std::f32::consts::FRAC_PI_2,
+        &[(0.0, l.accent_a), (1.0, l.accent_b)],
+    )
+}
+
+pub fn theme(l: Look) -> Theme {
     Theme::custom(
         "cmusic",
         iced::theme::Palette {
-            background: INK,
-            text: white(0.92),
-            primary: ACCENT_A,
+            background: l.ink,
+            text: l.text,
+            primary: l.accent_a,
             ..Theme::Dark.palette()
         },
     )
 }
 
 /// Shown behind the backdrop image, and alone before any art has loaded.
-fn base(_: &Theme) -> container::Style {
-    container::Style {
-        background: Some(
-            gradient::Linear::new(2.4)
-                .add_stop(0.0, Color::from_rgb(0.07, 0.10, 0.24))
-                .add_stop(0.55, Color::from_rgb(0.16, 0.09, 0.30))
-                .add_stop(1.0, Color::from_rgb(0.03, 0.20, 0.26))
-                .into(),
-        ),
+fn base(l: Look) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(fill(
+            2.4,
+            &[(0.0, l.base[0]), (0.55, l.base[1]), (1.0, l.base[2])],
+        )),
         ..Default::default()
     }
 }
 
 /// Dims the backdrop so text stays readable on bright covers.
-fn scrim(_: &Theme) -> container::Style {
-    container::Style {
-        background: Some(
-            gradient::Linear::new(std::f32::consts::PI)
-                .add_stop(0.0, Color::from_rgba(0.02, 0.03, 0.08, 0.22))
-                .add_stop(1.0, Color::from_rgba(0.02, 0.03, 0.08, 0.50))
-                .into(),
-        ),
+fn scrim(l: Look) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(fill(
+            std::f32::consts::PI,
+            &[(0.0, l.scrim_top), (1.0, l.scrim_bottom)],
+        )),
         ..Default::default()
     }
 }
 
-fn glass(_: &Theme) -> container::Style {
-    container::Style {
-        text_color: Some(white(0.92)),
+fn glass(l: Look) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        text_color: Some(l.text),
         // Brighter at the top edge, like light catching a pane.
-        background: Some(
-            gradient::Linear::new(std::f32::consts::PI)
-                .add_stop(0.0, white(0.16))
-                .add_stop(0.12, white(0.08))
-                .add_stop(1.0, white(0.04))
-                .into(),
-        ),
-        border: border::rounded(20).color(white(0.22)).width(1),
+        background: Some(fill(
+            std::f32::consts::PI,
+            &[
+                (0.0, l.panel_top),
+                (0.12, l.panel_mid),
+                (1.0, l.panel_bottom),
+            ],
+        )),
+        border: border::rounded(l.radius_panel)
+            .color(l.panel_border)
+            .width(1),
         // No drop shadow: without a GPU driver iced renders in software, where a large
         // blurred shadow per panel is the most expensive thing on screen.
         ..Default::default()
@@ -451,7 +509,7 @@ fn glass(_: &Theme) -> container::Style {
 }
 
 /// Capsule button. `on` fills it with the accent (primary action, active toggle).
-fn pill(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+fn pill(l: Look, on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {
         let lift = match status {
             button::Status::Hovered => 0.08,
@@ -461,24 +519,25 @@ fn pill(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
         let disabled = status == button::Status::Disabled;
         button::Style {
             background: Some(if on {
-                accent()
+                accent(l)
             } else {
-                white(0.10 + lift).into()
+                tint(l.control, l.control.a + lift).into()
             }),
             text_color: match (on, disabled) {
-                (_, true) => white(0.3),
-                (true, _) => INK,
-                _ => white(0.92),
+                (_, true) => tint(l.text, 0.3),
+                (true, _) => l.ink,
+                _ => l.text,
             },
             border: border::rounded(999)
-                .color(white(if on { 0.5 + lift } else { 0.2 + lift }))
+                .color(if on {
+                    tint(Color::WHITE, 0.5 + lift)
+                } else {
+                    tint(l.control_border, l.control_border.a + lift)
+                })
                 .width(1),
             shadow: if on {
                 Shadow {
-                    color: Color {
-                        a: 0.35 + lift,
-                        ..ACCENT_A
-                    },
+                    color: tint(l.accent_a, 0.35 + lift),
                     offset: Vector::ZERO,
                     blur_radius: 16.0,
                 }
@@ -491,7 +550,7 @@ fn pill(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
 }
 
 /// List row: invisible until hovered. `on` marks the current queue entry.
-fn row_button(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+fn row_button(l: Look, on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {
         let a = match status {
             button::Status::Hovered => 0.10,
@@ -499,11 +558,11 @@ fn row_button(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
             _ => 0.0,
         } + if on { 0.14 } else { 0.0 };
         button::Style {
-            background: (a > 0.0).then(|| white(a).into()),
-            text_color: white(0.92),
-            border: border::rounded(12)
+            background: (a > 0.0).then(|| tint(l.control, a).into()),
+            text_color: l.text,
+            border: border::rounded(l.radius_row)
                 .color(if on {
-                    Color { a: 0.7, ..ACCENT_A }
+                    tint(l.accent_a, 0.7)
                 } else {
                     Color::TRANSPARENT
                 })
@@ -513,24 +572,30 @@ fn row_button(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
-fn field(_: &Theme, status: text_input::Status) -> text_input::Style {
-    let focused = matches!(status, text_input::Status::Focused { .. });
-    text_input::Style {
-        background: white(if focused { 0.14 } else { 0.08 }).into(),
-        border: border::rounded(999)
-            .color(if focused { ACCENT_A } else { white(0.2) })
-            .width(1),
-        icon: white(0.6),
-        placeholder: white(0.45),
-        value: white(0.95),
-        selection: Color { a: 0.4, ..ACCENT_A },
+fn field(l: Look) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
+    move |_, status| {
+        let focused = matches!(status, text_input::Status::Focused { .. });
+        text_input::Style {
+            background: tint(l.control, if focused { 0.14 } else { 0.08 }).into(),
+            border: border::rounded(999)
+                .color(if focused {
+                    l.accent_a
+                } else {
+                    l.control_border
+                })
+                .width(1),
+            icon: tint(l.text, 0.6),
+            placeholder: tint(l.text, 0.45),
+            value: tint(l.text, 0.95),
+            selection: tint(l.accent_a, 0.4),
+        }
     }
 }
 
-fn rail(_: &Theme, status: slider::Status) -> slider::Style {
-    slider::Style {
+fn rail(l: Look) -> impl Fn(&Theme, slider::Status) -> slider::Style {
+    move |_, status| slider::Style {
         rail: slider::Rail {
-            backgrounds: (accent(), white(0.16).into()),
+            backgrounds: (accent(l), tint(l.control, 0.16).into()),
             width: 4.0,
             border: border::rounded(2),
         },
@@ -542,24 +607,26 @@ fn rail(_: &Theme, status: slider::Status) -> slider::Style {
                     8.0
                 },
             },
-            background: Color::WHITE.into(),
+            background: tint(l.text, 1.0).into(),
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
         },
     }
 }
 
-fn scroll(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
-    let mut st = scrollable::default(theme, status);
-    let rail = scrollable::Rail {
-        background: None,
-        border: border::rounded(4),
-        scroller: scrollable::Scroller {
-            background: white(0.22).into(),
+fn scroll(l: Look) -> impl Fn(&Theme, scrollable::Status) -> scrollable::Style {
+    move |theme, status| {
+        let mut st = scrollable::default(theme, status);
+        let rail = scrollable::Rail {
+            background: None,
             border: border::rounded(4),
-        },
-    };
-    st.vertical_rail = rail;
-    st.horizontal_rail = rail;
-    st
+            scroller: scrollable::Scroller {
+                background: l.panel_border.into(),
+                border: border::rounded(4),
+            },
+        };
+        st.vertical_rail = rail;
+        st.horizontal_rail = rail;
+        st
+    }
 }

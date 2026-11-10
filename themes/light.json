@@ -1,0 +1,17 @@
+{
+  "accent_a": "#2f6fed",
+  "accent_b": "#6a8cff",
+  "ink": "#ffffff",
+  "text": "#1b1f27",
+  "text_dim": "#4a5160",
+  "panel_top": "#ffffffe6",
+  "panel_mid": "#ffffffe0",
+  "panel_bottom": "#ffffffd9",
+  "panel_border": "#00000026",
+  "control": "#0000001a",
+  "control_border": "#00000033",
+  "scrim_top": "#ffffff66",
+  "scrim_bottom": "#ffffff99",
+  "base": ["#dfe6f5", "#ece6f7", "#dcefef"],
+  "backdrop": false
+}

@@ -1,6 +1,7 @@
 //! State, messages and the pure update logic. `State::update` never touches the engine or the
 //! network: it returns an `Out` describing what the thin wrapper in `main.rs` must do.
 
+use crate::theme::{self, Look};
 use cmusic_core::{
     Command, CookieSource, Item, Lyrics, Page, PageRequest, Rating, Snapshot, Track, Update,
 };
@@ -10,18 +11,20 @@ use std::collections::{HashMap, HashSet};
 
 /// A tiny, heavily blurred copy of the art; the renderer stretches it over the window.
 // ponytail: runs inside update (a few ms on a 64 px image); move to a Task if it ever shows.
-fn blurred(bytes: &[u8]) -> Option<image::Handle> {
+fn blurred(bytes: &[u8], look: &Look) -> Option<image::Handle> {
     const N: u32 = 64;
     let img = ::image::load_from_memory(bytes).ok()?;
     let mut px = img
         .resize_to_fill(N, N, ::image::imageops::FilterType::Triangle)
-        .blur(6.0)
+        .blur(look.backdrop_blur)
         .to_rgba8();
     // Covers are often dull once blurred: push saturation so the glass has colour to refract.
     for p in px.pixels_mut() {
         let [r, g, b, _] = p.0.map(f32::from);
         let grey = 0.3 * r + 0.59 * g + 0.11 * b;
-        let lift = |c: f32| ((grey + (c - grey) * 1.9) * 1.15).clamp(0.0, 255.0) as u8;
+        let lift = |c: f32| {
+            ((grey + (c - grey) * look.backdrop_saturation) * 1.15).clamp(0.0, 255.0) as u8
+        };
         p.0 = [lift(r), lift(g), lift(b), 255];
     }
     Some(image::Handle::from_rgba(N, N, px.into_raw()))
@@ -65,6 +68,8 @@ pub enum Message {
     Art(String, Option<Vec<u8>>),
     Resized(Size),
     CloseRequested,
+    CycleTheme,
+    ReloadTheme,
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +107,9 @@ pub struct State {
     pub backdrop: Option<(String, image::Handle)>,
     requested: HashSet<String>,
     pub size: Size,
+    pub look: Look,
+    /// `theme::DEFAULT` or the stem of a file in the themes dir.
+    pub theme_name: String,
 }
 
 impl State {
@@ -121,6 +129,8 @@ impl State {
             backdrop: None,
             requested: HashSet::new(),
             size,
+            look: Look::default(),
+            theme_name: theme::DEFAULT.into(),
         }
     }
 
@@ -216,8 +226,33 @@ impl State {
                 out.commands.push(Command::Quit);
                 out.closing = true;
             }
+            Message::CycleTheme => {
+                let mut all = vec![theme::DEFAULT.to_string()];
+                all.extend(theme::list());
+                let at = all.iter().position(|n| *n == self.theme_name).unwrap_or(0);
+                let next = all[(at + 1) % all.len()].clone();
+                self.set_theme(next);
+            }
+            Message::ReloadTheme => self.set_theme(self.theme_name.clone()),
         }
         out
+    }
+
+    /// On failure the current look stays and the error becomes the notice.
+    // ponytail: reads the file inside update (a few hundred bytes); move to a Task if it ever shows.
+    fn set_theme(&mut self, name: String) {
+        let loaded = theme::load(&name);
+        // The name sticks even when broken, so cycling moves on and Ctrl+R retries the file.
+        self.theme_name = name;
+        match loaded {
+            Ok(look) => {
+                self.look = look;
+                self.notice = Some(format!("Theme: {}", self.theme_name));
+                self.backdrop = None;
+                self.refresh_backdrop();
+            }
+            Err(e) => self.notice = Some(e),
+        }
     }
 
     fn fetch(&mut self, r: PageRequest, out: &mut Out) {
@@ -273,6 +308,10 @@ impl State {
 
     /// Rebuilds the backdrop when the current track's art is loaded and differs from it.
     fn refresh_backdrop(&mut self) {
+        if !self.look.backdrop {
+            self.backdrop = None;
+            return;
+        }
         let Some(url) = self
             .snapshot
             .current()
@@ -284,7 +323,7 @@ impl State {
             return;
         }
         if let Some(image::Handle::Bytes(_, bytes)) = self.art.get(url) {
-            if let Some(h) = blurred(bytes) {
+            if let Some(h) = blurred(bytes, &self.look) {
                 self.backdrop = Some((url.clone(), h));
             }
         }
