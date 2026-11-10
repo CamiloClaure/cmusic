@@ -1,0 +1,10 @@
+[package]
+name = "cmusic-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cmusic-core.workspace = true
+tokio.workspace = true
+iced = { version = "0.14", features = ["tokio", "image"] }

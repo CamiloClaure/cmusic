@@ -1,0 +1,18 @@
+[package]
+name = "cmusic-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ytmapi-rs = { version = "0.3", default-features = false, features = ["rustls", "simplified-queries"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+libmpv2 = { version = "7", default-features = false }
+souvlaki = { version = "0.9", default-features = false, features = ["use_zbus"] }
+rookie = "0.5"
+directories = "6"
+futures = "0.3"
+log = "0.4"

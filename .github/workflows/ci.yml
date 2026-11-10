@@ -1,0 +1,42 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: libmpv (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libmpv-dev
+      - name: libmpv (macos)
+        if: runner.os == 'macOS'
+        run: |
+          brew install mpv
+          echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+      - name: libmpv (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        # Unverified until the first push: pulls the latest shinchiro libmpv dev build.
+        run: |
+          url=$(curl -s https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest \
+            | grep -o 'https://[^"]*mpv-dev-x86_64-[0-9][^"]*\.7z' | head -1)
+          curl -sL "$url" -o mpv-dev.7z
+          7z x mpv-dev.7z -ompv-dev
+          cp mpv-dev/libmpv.dll.a mpv-dev/mpv.lib
+          echo "RUSTFLAGS=-L $(cygpath -w "$PWD/mpv-dev")" >> "$GITHUB_ENV"
+          echo "$(cygpath -w "$PWD/mpv-dev")" >> "$GITHUB_PATH"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace

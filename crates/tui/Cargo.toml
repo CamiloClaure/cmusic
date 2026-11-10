@@ -1,0 +1,10 @@
+[package]
+name = "cmusic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cmusic-core.workspace = true
+tokio.workspace = true
+ratatui = "0.30"

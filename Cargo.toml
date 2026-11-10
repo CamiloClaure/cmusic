@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/tui", "crates/gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/CamiloClaure/cmusic"
+
+[workspace.dependencies]
+cmusic-core = { path = "crates/core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "time", "io-util", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
