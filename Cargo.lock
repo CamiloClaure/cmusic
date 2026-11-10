@@ -954,6 +954,8 @@ version = "0.1.0"
 dependencies = [
  "cmusic-core",
  "iced",
+ "reqwest",
+ "serde_json",
  "tokio",
 ]
 

@@ -8,3 +8,5 @@ license.workspace = true
 cmusic-core.workspace = true
 tokio.workspace = true
 iced = { version = "0.14", features = ["tokio", "image"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde_json.workspace = true
