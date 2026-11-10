@@ -30,6 +30,42 @@ fn blurred(bytes: &[u8], look: &Look) -> Option<image::Handle> {
     Some(image::Handle::from_rgba(N, N, px.into_raw()))
 }
 
+/// Video-type thumbnails have black bars baked in (a 16:9 frame letterboxed into a square).
+/// Crops them off to the centred square of the picture (re-encoded as PNG); anything else comes
+/// back untouched. Called from the fetch task, never from the view.
+// ponytail: a cover that really has near-black bands top and bottom gets cropped too.
+pub fn trim_bars(bytes: Vec<u8>) -> Vec<u8> {
+    let Ok(img) = ::image::load_from_memory(&bytes) else {
+        return bytes;
+    };
+    let (w, h) = (img.width(), img.height());
+    let px = img.to_rgb8();
+    let dark = |y: u32| (0..w).all(|x| px.get_pixel(x, y).0.iter().all(|&c| c < 40));
+    let top = (0..h).take_while(|&y| dark(y)).count() as u32;
+    let bottom = (0..h).rev().take_while(|&y| dark(y)).count() as u32;
+    if top < h / 16 || bottom < h / 16 || top + bottom >= h {
+        return bytes;
+    }
+    let side = (h - top - bottom).min(w);
+    // Real letterboxing leaves a wide picture; anything else is just a dark cover.
+    if w * 10 < side * 12 {
+        return bytes;
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    match img
+        .crop_imm(
+            (w - side) / 2,
+            top + (h - top - bottom - side) / 2,
+            side,
+            side,
+        )
+        .write_to(&mut out, ::image::ImageFormat::Png)
+    {
+        Ok(()) => out.into_inner(),
+        Err(_) => bytes,
+    }
+}
+
 /// Art is requested for this many rows when a page loads.
 // ponytail: later rows keep the placeholder; request on scroll if that bothers anyone.
 pub const ART_ROWS: usize = 30;
@@ -107,6 +143,10 @@ pub struct State {
     pub art: HashMap<String, image::Handle>,
     /// Blurred art of the current track (keyed by its url), drawn behind everything.
     pub backdrop: Option<(String, image::Handle)>,
+    /// Video ids liked in this session or listed on the liked-songs page.
+    // ponytail: session-local; the engine has no "is liked" query, so a like made elsewhere or
+    // outside the open liked page stays unfilled until that page is opened.
+    pub liked: HashSet<String>,
     requested: HashSet<String>,
     pub size: Size,
     pub look: Look,
@@ -130,6 +170,7 @@ impl State {
             drag: None,
             art: HashMap::new(),
             backdrop: None,
+            liked: HashSet::new(),
             requested: HashSet::new(),
             size,
             look: Look::default(),
@@ -178,10 +219,15 @@ impl State {
             }
             Message::PlayNext(t) => out.commands.push(Command::PlayNext(vec![t])),
             Message::Enqueue(t) => out.commands.push(Command::Enqueue(vec![t])),
-            Message::Like(video_id) => out.commands.push(Command::Rate {
-                video_id,
-                rating: Rating::Like,
-            }),
+            Message::Like(video_id) => {
+                let rating = if self.liked.remove(&video_id) {
+                    Rating::None
+                } else {
+                    self.liked.insert(video_id.clone());
+                    Rating::Like
+                };
+                out.commands.push(Command::Rate { video_id, rating });
+            }
             Message::TogglePause => out.commands.push(Command::TogglePause),
             Message::Next => out.commands.push(Command::Next),
             Message::Prev => out.commands.push(Command::Prev),
@@ -282,6 +328,13 @@ impl State {
                 self.awaiting = None;
                 match result {
                     Ok(page) => {
+                        if request == PageRequest::LikedSongs {
+                            self.liked
+                                .extend(page.items.iter().filter_map(|it| match it {
+                                    Item::Track(t) => Some(t.video_id.clone()),
+                                    _ => None,
+                                }));
+                        }
                         out.art = self.want_art(page.items.iter().take(ART_ROWS).map(thumb));
                         if let Some(prev) = self.current.replace((request, page)) {
                             self.history.push(prev);
@@ -498,6 +551,57 @@ mod tests {
         s.update(Message::Engine(Update::Notice("Logged in".into())));
         assert!(s.login.is_none());
         assert!(s.logged_in);
+    }
+
+    #[test]
+    fn like_toggles_and_liked_page_fills() {
+        let mut s = state();
+        let rate = |r| Command::Rate {
+            video_id: "a".into(),
+            rating: r,
+        };
+        assert_eq!(
+            s.update(Message::Like("a".into())).commands,
+            vec![rate(Rating::Like)]
+        );
+        assert!(s.liked.contains("a"));
+        assert_eq!(
+            s.update(Message::Like("a".into())).commands,
+            vec![rate(Rating::None)]
+        );
+        assert!(s.liked.is_empty());
+        s.update(Message::Open(PageRequest::LikedSongs));
+        s.update(page_update(
+            PageRequest::LikedSongs,
+            vec![Item::Track(track("x")), Item::Album(entry("al"))],
+        ));
+        assert_eq!(s.liked, HashSet::from(["x".to_string()]));
+    }
+
+    #[test]
+    fn trim_bars_crops_black_bands_only() {
+        let enc = |img: ::image::RgbImage| {
+            let mut o = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut o, ::image::ImageFormat::Png).unwrap();
+            o.into_inner()
+        };
+        let dim = |b: &[u8]| ::image::load_from_memory(b).map(|i| (i.width(), i.height()));
+        let bars = ::image::RgbImage::from_fn(30, 30, |_, y| {
+            ::image::Rgb(if (4..26).contains(&y) {
+                [200, 90, 30]
+            } else {
+                [0, 0, 0]
+            })
+        });
+        assert_eq!(dim(&trim_bars(enc(bars))).unwrap(), (22, 22));
+        let full = enc(::image::RgbImage::from_pixel(
+            40,
+            30,
+            ::image::Rgb([200, 90, 30]),
+        ));
+        assert_eq!(trim_bars(full.clone()), full);
+        let wide = enc(::image::RgbImage::new(40, 20));
+        assert_eq!(trim_bars(wide.clone()), wide);
     }
 
     #[test]

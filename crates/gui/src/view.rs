@@ -1,15 +1,31 @@
 use crate::app::{thumb, Message, State};
+use crate::icons;
 use crate::theme::Look;
 use cmusic_core::{lyrics, Item, PageRequest, Repeat, Status, Track};
+use iced::widget::svg::{self, Svg};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, image, row, scrollable, slider, space, stack, text, text_input,
+    button, column, container, hover, image, row, scrollable, slider, space, stack, text,
+    text_input, tooltip,
 };
-use iced::{border, gradient, Background, Center, Color, ContentFit, Element, Fill, Theme};
+use iced::{
+    border, gradient, Background, Center, Color, ContentFit, Element, Fill, Padding, Right, Theme,
+};
+use std::time::Duration;
 
 /// Rows rendered per list.
 // ponytail: no virtualization; a lazy/windowed list is the upgrade if 500 rows ever feels slow.
 const MAX_ROWS: usize = 500;
+
+/// Type scale: section title, body, secondary (times for the lyrics view aside).
+const T: f32 = 22.0;
+const B: f32 = 15.0;
+const S: f32 = 13.0;
+/// Height shared by the main and queue headers so they sit on one baseline.
+const HEAD: f32 = 36.0;
+/// Width of the duration column and of the three row action buttons.
+const DUR: f32 = 44.0;
+const ACT: f32 = 28.0;
 
 pub fn view(s: &State) -> Element<'_, Message> {
     let l = s.look;
@@ -21,7 +37,7 @@ pub fn view(s: &State) -> Element<'_, Message> {
         ]
         .spacing(l.gap)
         .height(Fill),
-        panel(l, column![bar(s), controls(s)].spacing(l.pad)),
+        panel(l, bar(s)),
     ]
     .spacing(l.gap)
     .padding(l.gap);
@@ -54,11 +70,16 @@ fn sz(l: Look, n: f32) -> f32 {
 }
 
 fn txt<'a>(l: Look, t: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
-    text(t).size(sz(l, 16.0))
+    text(t).size(sz(l, B))
 }
 
 fn line<'a>(l: Look, t: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
     txt(l, t).wrapping(Wrapping::None)
+}
+
+/// Secondary text: dimmed, small.
+fn dim<'a>(l: Look, t: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
+    text(t).size(sz(l, S)).color(l.text_dim)
 }
 
 /// Rail width plus the gap an embedded scrollbar takes from its content.
@@ -97,6 +118,72 @@ fn art<'a>(s: &'a State, url: Option<&String>, size: u32) -> Element<'a, Message
     }
 }
 
+/// `art`, with an equalizer glyph over it when this row is the track being played.
+fn art_mark<'a>(
+    s: &'a State,
+    url: Option<&String>,
+    size: u32,
+    playing: bool,
+) -> Element<'a, Message> {
+    let l = s.look;
+    let a = art(s, url, size);
+    if !playing {
+        return a;
+    }
+    stack![
+        a,
+        container(ico(icons::equalizer(), size as f32 * 0.5, l.accent_a))
+            .center(size)
+            .style(move |_| container::Style {
+                background: Some(tint(l.ink, 0.6).into()),
+                border: border::rounded(size as f32 / 5.0),
+                ..Default::default()
+            })
+    ]
+    .into()
+}
+
+/// An icon tinted with `color` (the svg is black; this replaces its colour).
+fn ico(icon: Svg<'static>, size: f32, color: Color) -> Svg<'static> {
+    icon.width(size)
+        .height(size)
+        .style(move |_, _| svg::Style { color: Some(color) })
+}
+
+/// Square icon-only button with a tooltip naming the action; `m` None draws it disabled.
+fn ibtn<'a>(
+    l: Look,
+    icon: Svg<'static>,
+    size: f32,
+    tip: impl Into<String>,
+    m: Option<Message>,
+    style: impl Fn(&Theme, button::Status) -> button::Style + 'a,
+    color: Color,
+) -> Element<'a, Message> {
+    let inner: Element<'a, Message> = container(ico(icon, size * 0.55, color)).center(Fill).into();
+    let b = button(inner)
+        .on_press_maybe(m)
+        .width(size)
+        .height(size)
+        .padding(0)
+        .style(style);
+    tooltip(
+        b,
+        container(text(tip.into()).size(sz(l, S)))
+            .padding([3, 8])
+            .style(move |_| container::Style {
+                background: Some(tint(l.ink, 0.92).into()),
+                text_color: Some(l.text),
+                border: border::rounded(6).color(l.panel_border).width(1),
+                ..Default::default()
+            }),
+        tooltip::Position::Top,
+    )
+    .gap(4)
+    .delay(Duration::from_millis(400))
+    .into()
+}
+
 fn sidebar(s: &State) -> Element<'_, Message> {
     let l = s.look;
     let open = s.current.as_ref().map(|(r, _)| r);
@@ -108,13 +195,23 @@ fn sidebar(s: &State) -> Element<'_, Message> {
             .padding([8, 12])
             .style(row_button(l, on))
     };
-    column![
+    let search = stack![
         text_input("Search", &s.search)
             .on_input(Message::SearchInput)
             .on_submit(Message::SearchSubmit)
-            .padding([8, 14])
-            .size(sz(l, 16.0))
+            .padding(Padding {
+                left: 36.0,
+                ..Padding::from([8.0, 14.0])
+            })
+            .size(sz(l, B))
             .style(field(l)),
+        container(ico(icons::search(), 16.0, tint(l.text, 0.6)))
+            .padding([0, 12])
+            .height(Fill)
+            .align_y(Center),
+    ];
+    column![
+        search,
         nav("Liked songs", PageRequest::LikedSongs),
         nav("Playlists", PageRequest::LibraryPlaylists),
         nav("Songs", PageRequest::LibrarySongs),
@@ -122,17 +219,59 @@ fn sidebar(s: &State) -> Element<'_, Message> {
         nav("Artists", PageRequest::LibraryArtists),
         space().height(Fill),
         button(
-            txt(l, if s.logged_in { "Account" } else { "Log in" })
-                .center()
-                .width(Fill)
+            row![
+                ico(icons::user(), 16.0, l.text),
+                txt(l, if s.logged_in { "Account" } else { "Log in" })
+            ]
+            .spacing(l.pad)
+            .align_y(Center)
         )
         .on_press(Message::OpenLogin)
         .width(Fill)
+        .padding([6, 14])
         .style(pill(l, false)),
     ]
     .spacing(4)
     .width(180)
     .into()
+}
+
+/// Section title row: `lead` (a back button, or nothing) then the title.
+fn head<'a>(l: Look, title: String, trail: Option<Element<'a, Message>>) -> Element<'a, Message> {
+    let mut r = row![text(title)
+        .size(sz(l, T))
+        .wrapping(Wrapping::None)
+        .width(Fill)]
+    .spacing(l.pad)
+    .align_y(Center)
+    .height(HEAD);
+    if let Some(t) = trail {
+        r = r.push(t);
+    }
+    r.into()
+}
+
+/// Centred message for loading, empty and first-start states.
+fn hint<'a>(l: Look, title: Option<String>, msg: &'static str) -> Element<'a, Message> {
+    let mut c = column![].spacing(6).align_x(Center);
+    if let Some(t) = title {
+        c = c.push(text(t).size(sz(l, T)).center());
+    }
+    container(c.push(dim(l, msg).center())).center(Fill).into()
+}
+
+fn request_name(r: &PageRequest) -> String {
+    match r {
+        PageRequest::Search(q) => format!("Search: {q}"),
+        PageRequest::LibraryPlaylists => "Playlists".into(),
+        PageRequest::LibrarySongs => "Songs".into(),
+        PageRequest::LibraryAlbums => "Albums".into(),
+        PageRequest::LibraryArtists => "Artists".into(),
+        PageRequest::LikedSongs => "Liked songs".into(),
+        PageRequest::Playlist(_) => "Playlist".into(),
+        PageRequest::Album(_) => "Album".into(),
+        PageRequest::Artist(_) => "Artist".into(),
+    }
 }
 
 fn main_area(s: &State) -> Element<'_, Message> {
@@ -144,45 +283,93 @@ fn main_area(s: &State) -> Element<'_, Message> {
         return lyrics_view(s);
     }
     let title = match (&s.awaiting, &s.current) {
-        (Some(_), _) => "Loading...".to_string(),
         (None, Some((_, p))) => p.title.clone(),
-        (None, None) => "Search or pick something on the left".to_string(),
+        _ => String::new(),
     };
-    let header = row![
-        text(title)
-            .size(sz(l, 22.0))
-            .wrapping(Wrapping::None)
-            .width(Fill),
-        button(txt(l, "Back"))
-            .on_press_maybe((!s.history.is_empty()).then_some(Message::Back))
-            .style(pill(l, false)),
-    ]
-    .align_y(Center);
-    let mut rows = column![].spacing(4);
+    let can_back = !s.history.is_empty();
+    let back = ibtn(
+        l,
+        icons::chevron_left(),
+        HEAD - 4.0,
+        "Back",
+        can_back.then_some(Message::Back),
+        row_button(l, false),
+        if can_back { l.text } else { tint(l.text, 0.3) },
+    );
     // Window minus panels, sidebar, queue, art, duration, three buttons and the gaps between.
     let avail =
         (s.size.width - 10.0 * l.gap - 460.0 - 5.0 * l.pad - RAIL - 250.0 * l.font_scale).max(80.0);
-    let mut note = None;
-    if let Some((_, page)) = &s.current {
-        for (i, it) in page.items.iter().enumerate().take(MAX_ROWS) {
-            rows = rows.push(item_row(s, i, it, avail));
+    let body: Element<_> = match (&s.awaiting, &s.current) {
+        (Some(r), _) => hint(l, Some(request_name(r)), "Loading..."),
+        (None, Some((_, p))) if !p.items.is_empty() => {
+            let mut rows = column![].spacing(4);
+            for (i, it) in p.items.iter().enumerate().take(MAX_ROWS) {
+                rows = rows.push(item_row(s, i, it, avail));
+            }
+            let list = scrollable(rows.padding([0.0, l.pad]))
+                .spacing(6)
+                .style(scroll(l))
+                .height(Fill)
+                .width(Fill);
+            if p.items.len() > MAX_ROWS {
+                column![
+                    list,
+                    dim(l, format!("showing {MAX_ROWS} of {}", p.items.len()))
+                ]
+                .spacing(l.pad)
+                .into()
+            } else {
+                list.into()
+            }
         }
-        if page.items.len() > MAX_ROWS {
-            note = Some(format!("showing {MAX_ROWS} of {}", page.items.len()));
-        }
-    }
+        (None, Some(_)) => hint(l, None, "Nothing here"),
+        (None, None) => hint(
+            l,
+            Some("Welcome to cmusic".into()),
+            "Type in the search box on the left, or pick something from your library.",
+        ),
+    };
     column![
-        header,
-        scrollable(rows.padding([0.0, l.pad]))
-            .spacing(6)
-            .style(scroll(l))
-            .height(Fill)
-            .width(Fill),
-        text(note.unwrap_or_default()).size(sz(l, 13.0))
+        row![back, head(l, title, None)]
+            .spacing(l.pad)
+            .align_y(Center),
+        body
     ]
     .spacing(l.pad)
     .width(Fill)
     .into()
+}
+
+/// A list row: one button over the whole row (hover highlights all of it) and, for tracks,
+/// action buttons that appear only while the pointer is over the row.
+fn list_row<'a>(
+    l: Look,
+    body: impl Into<Element<'a, Message>>,
+    press: Message,
+    actions: Option<(Element<'a, Message>, f32)>,
+) -> Element<'a, Message> {
+    let b = button(body)
+        .on_press(press)
+        .width(Fill)
+        .padding([4.0, l.pad])
+        .clip(true)
+        .style(row_button(l, false));
+    match actions {
+        None => b.into(),
+        // `right` is what stays visible at the end of the row (duration), so actions sit left of it.
+        Some((a, right)) => hover(
+            b,
+            container(a)
+                .width(Fill)
+                .height(Fill)
+                .align_x(Right)
+                .align_y(Center)
+                .padding(Padding {
+                    right: right + l.pad,
+                    ..Padding::ZERO
+                }),
+        ),
+    }
 }
 
 fn item_row<'a>(s: &'a State, i: usize, it: &'a Item, w: f32) -> Element<'a, Message> {
@@ -205,40 +392,66 @@ fn item_row<'a>(s: &'a State, i: usize, it: &'a Item, w: f32) -> Element<'a, Mes
             Some(PageRequest::Artist(e.id.clone())),
         ),
     };
-    let label = button(column![
-        line(l, fit(l, title, w, 16.0)),
-        line(l, fit(l, sub, w, 13.0))
-            .size(sz(l, 13.0))
-            .color(l.text_dim)
-    ])
-    .on_press(open.map_or(Message::PlayRow(i), Message::Open))
-    .width(Fill)
-    .clip(true)
-    .style(row_button(l, false));
-    let mut r = row![art(s, thumb(it).as_ref(), 40), label]
-        .spacing(l.pad)
-        .align_y(Center);
-    if let Item::Track(t) = it {
-        r = r.push(
-            line(
-                l,
-                t.duration_secs.map(|d| mmss(d as f64)).unwrap_or_default(),
-            )
-            .width(48),
-        );
-        r = r.push(small(l, "Next", Message::PlayNext(t.clone())));
-        r = r.push(small(l, "Add", Message::Enqueue(t.clone())));
-        r = r.push(small(l, "Like", Message::Like(t.video_id.clone())));
+    let playing = matches!(it, Item::Track(t) if Some(&t.video_id) == s.snapshot.current().map(|c| &c.video_id));
+    let mut name = line(l, fit(l, title, w, B));
+    if playing {
+        name = name.color(l.accent_a);
     }
-    r.into()
-}
-
-fn small(l: Look, label: &'static str, m: Message) -> Element<'static, Message> {
-    button(text(label).size(sz(l, 13.0)))
-        .on_press(m)
-        .padding([4, 10])
-        .style(pill(l, false))
-        .into()
+    let mut body = row![
+        art_mark(s, thumb(it).as_ref(), 40, playing),
+        column![name, dim(l, fit(l, sub, w, S)).wrapping(Wrapping::None)].width(Fill)
+    ]
+    .spacing(l.pad)
+    .align_y(Center);
+    let press = open.map_or(Message::PlayRow(i), Message::Open);
+    let Item::Track(t) = it else {
+        return list_row(l, body, press, None);
+    };
+    body = body.push(
+        dim(
+            l,
+            t.duration_secs.map(|d| mmss(d as f64)).unwrap_or_default(),
+        )
+        .width(DUR)
+        .align_x(Right),
+    );
+    let ghost = || row_button(l, false);
+    let liked = s.liked.contains(&t.video_id);
+    let actions = row![
+        ibtn(
+            l,
+            icons::play_next(),
+            ACT,
+            "Play next",
+            Some(Message::PlayNext(t.clone())),
+            ghost(),
+            l.text
+        ),
+        ibtn(
+            l,
+            icons::plus(),
+            ACT,
+            "Add to queue",
+            Some(Message::Enqueue(t.clone())),
+            ghost(),
+            l.text
+        ),
+        ibtn(
+            l,
+            if liked {
+                icons::heart_filled()
+            } else {
+                icons::heart()
+            },
+            ACT,
+            if liked { "Unlike" } else { "Like" },
+            Some(Message::Like(t.video_id.clone())),
+            ghost(),
+            if liked { l.accent_a } else { l.text },
+        ),
+    ]
+    .spacing(2);
+    list_row(l, body, press, Some((actions.into(), DUR)))
 }
 
 fn lyrics_view(s: &State) -> Element<'_, Message> {
@@ -263,9 +476,9 @@ fn lyrics_view(s: &State) -> Element<'_, Message> {
                 .width(Fill)
                 .into()
         }
-        _ => txt(l, "No lyrics").into(),
+        _ => hint(l, None, "No lyrics"),
     };
-    column![text("Lyrics").size(sz(l, 22.0)), body]
+    column![head(l, "Lyrics".into(), None), body]
         .spacing(l.pad)
         .width(Fill)
         .into()
@@ -274,8 +487,8 @@ fn lyrics_view(s: &State) -> Element<'_, Message> {
 fn login(s: &State) -> Element<'_, Message> {
     let l = s.look;
     let lg = s.login.as_ref().expect("checked by caller");
-    column![
-        text("Log in").size(sz(l, 22.0)),
+    let form = column![
+        text("Log in").size(sz(l, T)),
         txt(
             l,
             lg.message
@@ -291,44 +504,61 @@ fn login(s: &State) -> Element<'_, Message> {
             .on_input(Message::CookieInput)
             .on_submit(Message::UseCookie)
             .padding([8, 14])
-            .size(sz(l, 16.0))
+            .size(sz(l, B))
             .style(field(l)),
-        button(txt(l, "Use pasted cookie"))
-            .on_press(Message::UseCookie)
-            .style(pill(l, false)),
-        button(txt(l, "Close"))
-            .on_press(Message::CloseLogin)
-            .style(pill(l, false)),
+        dim(
+            l,
+            "DevTools > Network > any browse request > Cookie request header"
+        ),
+        row![
+            button(txt(l, "Use pasted cookie"))
+                .on_press(Message::UseCookie)
+                .style(pill(l, false)),
+            button(txt(l, "Close"))
+                .on_press(Message::CloseLogin)
+                .style(pill(l, false)),
+        ]
+        .spacing(l.pad),
     ]
-    .spacing(l.pad)
+    .spacing(l.pad + 4.0)
     .width(Fill)
-    .into()
+    .max_width(420);
+    container(form).center(Fill).padding(l.pad).into()
 }
 
 fn queue(s: &State) -> Element<'_, Message> {
     let l = s.look;
     let snap = &s.snapshot;
     let mut c = column![].spacing(2);
-    // Queue column minus the remove button, the row button padding and the rail.
-    let w = 280.0 - 28.0 - 10.0 - RAIL;
+    // Queue column minus art, the remove button, row paddings and the rail.
+    let w = 280.0 - 36.0 - ACT - 3.0 * l.pad - RAIL;
     for (i, t) in snap.queue.iter().enumerate().take(MAX_ROWS) {
         let cur = snap.cursor == Some(i);
-        let name = button(column![
-            line(l, fit(l, &t.title, w, 16.0)),
-            line(l, fit(l, &t.artists, w, 12.0)).size(sz(l, 12.0))
-        ])
-        .on_press(Message::Jump(i))
-        .width(Fill)
-        .clip(true)
-        .style(row_button(l, false));
-        let x = button(txt(l, "x").center())
-            .on_press(Message::Remove(i))
-            .width(28)
-            .height(28)
-            .padding(0)
-            .style(row_button(l, false));
+        let mut name = line(l, fit(l, &t.title, w, B));
+        if cur {
+            name = name.color(l.accent_a);
+        }
+        let body = row![
+            art_mark(s, t.thumbnail_url.as_ref(), 36, cur),
+            column![
+                name,
+                dim(l, fit(l, &t.artists, w, S)).wrapping(Wrapping::None)
+            ]
+            .width(Fill)
+        ]
+        .spacing(l.pad)
+        .align_y(Center);
+        let x = ibtn(
+            l,
+            icons::x(),
+            ACT,
+            "Remove from queue",
+            Some(Message::Remove(i)),
+            row_button(l, false),
+            l.text,
+        );
         c = c.push(
-            container(row![name, x].align_y(Center))
+            container(list_row(l, body, Message::Jump(i), Some((x, 0.0))))
                 .width(Fill)
                 .style(move |_| container::Style {
                     background: cur.then(|| tint(l.control, 0.14 + l.control.a).into()),
@@ -343,25 +573,36 @@ fn queue(s: &State) -> Element<'_, Message> {
                 }),
         );
     }
-    column![
-        row![
-            text("Queue").size(sz(l, 22.0)).width(Fill),
-            button(txt(l, "Clear"))
-                .on_press_maybe((!snap.queue.is_empty()).then_some(Message::ClearQueue))
-                .style(pill(l, false)),
-        ]
-        .align_y(Center),
+    let body: Element<_> = if snap.queue.is_empty() {
+        hint(l, None, "Queue is empty - play something")
+    } else {
         scrollable(c)
             .spacing(6)
             .style(scroll(l))
             .height(Fill)
-            .width(Fill),
+            .width(Fill)
+            .into()
+    };
+    column![
+        head(
+            l,
+            "Queue".into(),
+            Some(
+                button(txt(l, "Clear"))
+                    .on_press_maybe((!snap.queue.is_empty()).then_some(Message::ClearQueue))
+                    .style(pill(l, false))
+                    .into()
+            )
+        ),
+        body,
     ]
     .spacing(l.pad)
     .width(280)
     .into()
 }
 
+/// Now-playing bar: art and text on the left, transport over the seek bar in the middle,
+/// volume and toggles on the right.
 fn bar(s: &State) -> Element<'_, Message> {
     let l = s.look;
     let snap = &s.snapshot;
@@ -372,17 +613,14 @@ fn bar(s: &State) -> Element<'_, Message> {
         Status::Error => "Error",
         _ => "",
     };
+    const W: f32 = 220.0;
+    // Fixed three lines so a notice never moves anything.
     let info = column![
         line(
             l,
-            fit(
-                l,
-                cur.map_or("Nothing playing", |t| t.title.as_str()),
-                220.0,
-                16.0
-            )
+            fit(l, cur.map_or("Nothing playing", |t| t.title.as_str()), W, B)
         ),
-        line(
+        dim(
             l,
             fit(
                 l,
@@ -391,90 +629,153 @@ fn bar(s: &State) -> Element<'_, Message> {
                     ("", None) => "",
                     (st, _) => st,
                 },
-                220.0,
-                13.0
+                W,
+                S
             )
         )
-        .size(sz(l, 13.0))
-        .color(l.text_dim),
+        .wrapping(Wrapping::None)
+        .height(sz(l, S) * 1.4),
+        dim(
+            l,
+            fit(
+                l,
+                s.notice
+                    .as_deref()
+                    .or(snap.last_error.as_deref())
+                    .unwrap_or(""),
+                W,
+                S
+            )
+        )
+        .wrapping(Wrapping::None)
+        .height(sz(l, S) * 1.4),
     ];
-    let info = container(info).width(220).clip(true);
+    let info = container(info).width(W).clip(true);
     let playing = matches!(snap.status, Status::Playing | Status::Buffering);
     let max = snap.duration_secs.max(1.0);
     let pos = s.drag.unwrap_or(snap.position_secs).min(max);
-    row![
-        art(s, cur.and_then(|t| t.thumbnail_url.as_ref()), 48),
-        info,
-        button(txt(l, "Prev"))
-            .on_press(Message::Prev)
-            .style(pill(l, false)),
-        button(
-            txt(l, if playing { "Pause" } else { "Play" })
-                .center()
-                .width(Fill)
-        )
-        .on_press(Message::TogglePause)
-        .width(84)
-        .padding([9, 0])
-        .style(pill(l, true)),
-        button(txt(l, "Next"))
-            .on_press(Message::Next)
-            .style(pill(l, false)),
-        text(mmss(pos)).size(sz(l, 13.0)).color(l.text_dim),
+    let transport = row![
+        ibtn(
+            l,
+            icons::skip_prev(),
+            36.0,
+            "Previous",
+            Some(Message::Prev),
+            pill(l, false),
+            l.text
+        ),
+        ibtn(
+            l,
+            if playing {
+                icons::pause()
+            } else {
+                icons::play()
+            },
+            46.0,
+            if playing { "Pause" } else { "Play" },
+            Some(Message::TogglePause),
+            pill(l, true),
+            l.ink
+        ),
+        ibtn(
+            l,
+            icons::skip_next(),
+            36.0,
+            "Next",
+            Some(Message::Next),
+            pill(l, false),
+            l.text
+        ),
+    ]
+    .spacing(l.pad + 4.0)
+    .align_y(Center);
+    let seek = row![
+        dim(l, mmss(pos)).width(44).align_x(Right),
         slider(0.0..=max, pos, Message::SeekChanged)
             .on_release(Message::SeekReleased)
             .width(Fill)
             .style(rail(l)),
-        text(mmss(snap.duration_secs))
-            .size(sz(l, 13.0))
-            .color(l.text_dim),
+        dim(l, mmss(snap.duration_secs)).width(44),
     ]
-    .spacing(l.pad)
-    .align_y(Center)
-    .into()
-}
-
-/// Second bar row: status line on the left, volume and toggles on the right.
-fn controls(s: &State) -> Element<'_, Message> {
-    let l = s.look;
-    let snap = &s.snapshot;
-    let on = |label: String, active: bool, m: Message| {
-        button(text(label).size(sz(l, 13.0)))
-            .on_press(m)
-            .padding([4, 10])
-            .style(pill(l, active))
+    .spacing(l.pad + 4.0)
+    .align_y(Center);
+    let tog = |icon: Svg<'static>, tip: &str, on: bool, m: Message| {
+        ibtn(
+            l,
+            icon,
+            32.0,
+            tip,
+            Some(m),
+            pill(l, on),
+            if on { l.ink } else { l.text },
+        )
     };
     let repeat = match snap.repeat {
-        Repeat::Off => "Repeat: off",
-        Repeat::All => "Repeat: all",
-        Repeat::One => "Repeat: one",
+        Repeat::Off => ("Repeat: off", icons::repeat()),
+        Repeat::All => ("Repeat: all", icons::repeat()),
+        Repeat::One => ("Repeat: one", icons::repeat_one()),
     };
-    row![
-        line(
-            l,
-            s.notice
-                .as_deref()
-                .or(snap.last_error.as_deref())
-                .unwrap_or("")
+    let toggles = row![
+        tog(icons::shuffle(), "Shuffle", snap.shuffle, Message::Shuffle),
+        tog(
+            repeat.1,
+            repeat.0,
+            snap.repeat != Repeat::Off,
+            Message::Repeat
+        ),
+        tooltip(
+            button(text("Normalize").size(sz(l, S)))
+                .on_press(Message::Normalize)
+                .padding([6, 10])
+                .style(pill(l, snap.normalize)),
+            container(text("Even out loudness between tracks").size(sz(l, S)))
+                .padding([3, 8])
+                .style(move |_| container::Style {
+                    background: Some(tint(l.ink, 0.92).into()),
+                    text_color: Some(l.text),
+                    border: border::rounded(6).color(l.panel_border).width(1),
+                    ..Default::default()
+                }),
+            tooltip::Position::Top
         )
-        .size(sz(l, 13.0))
-        .color(l.text_dim)
-        .width(Fill),
-        text("Vol").size(sz(l, 13.0)),
-        slider(0..=100u8, snap.volume, Message::Volume)
-            .width(100)
-            .style(rail(l)),
-        on("Shuffle".into(), snap.shuffle, Message::Shuffle),
-        on(repeat.into(), snap.repeat != Repeat::Off, Message::Repeat),
-        on("Normalize".into(), snap.normalize, Message::Normalize),
-        on("Lyrics".into(), s.show_lyrics, Message::ToggleLyrics),
-        on(
-            format!("Theme: {}", s.theme_name),
+        .gap(4)
+        .delay(Duration::from_millis(400)),
+        tog(
+            icons::music(),
+            "Lyrics",
+            s.show_lyrics,
+            Message::ToggleLyrics
+        ),
+        tog(
+            icons::palette(),
+            &format!("Theme: {}", s.theme_name),
             false,
             Message::CycleTheme
         ),
     ]
+    .spacing(6)
+    .align_y(Center);
+    let volume = row![
+        ico(icons::volume(), 16.0, l.text_dim),
+        slider(0..=100u8, snap.volume, Message::Volume)
+            .width(110)
+            .style(rail(l)),
+    ]
     .spacing(l.pad)
+    .align_y(Center);
+    row![
+        art(s, cur.and_then(|t| t.thumbnail_url.as_ref()), 64),
+        info,
+        column![transport, seek]
+            .spacing(4)
+            .align_x(Center)
+            .width(Fill),
+        column![toggles, volume]
+            .spacing(l.pad)
+            .align_x(Right)
+            .width(250),
+    ]
+    .spacing(l.pad + 4.0)
     .align_y(Center)
     .into()
 }

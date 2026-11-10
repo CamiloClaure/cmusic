@@ -1,4 +1,5 @@
 mod app;
+mod icons;
 mod theme;
 mod view;
 
@@ -132,7 +133,7 @@ async fn fetch_art(url: String) -> Option<Vec<u8>> {
         .join("art")
         .join(format!("{:016x}", h.finish()));
     if let Ok(b) = tokio::fs::read(&path).await {
-        return Some(b);
+        return tokio::task::spawn_blocking(|| app::trim_bars(b)).await.ok();
     }
     let client = HTTP.get_or_init(reqwest::Client::new);
     let bytes = client
@@ -149,7 +150,9 @@ async fn fetch_art(url: String) -> Option<Vec<u8>> {
         let _ = tokio::fs::create_dir_all(dir).await;
     }
     let _ = tokio::fs::write(&path, &bytes).await;
-    Some(bytes.to_vec())
+    tokio::task::spawn_blocking(move || app::trim_bars(bytes.to_vec()))
+        .await
+        .ok()
 }
 
 fn prefs_path() -> std::path::PathBuf {
