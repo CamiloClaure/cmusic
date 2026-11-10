@@ -26,6 +26,23 @@ Run the release build: without a GPU driver (WSL, virtual machines) the desktop 
 
 Needs the libmpv development files (`libmpv-dev` on Debian/Ubuntu, `brew install mpv` on macOS).
 
+## Keyboard (desktop app)
+Keys other than the Ctrl ones do nothing while a text field has focus.
+
+| Key | Action |
+|---|---|
+| `Space` | Play / pause |
+| `/` or `Ctrl+F` | Focus the search field (`Ctrl+F` also works inside a field) |
+| `Esc` | Close login or lyrics, otherwise go Back |
+| `Left` / `Right` | Seek -5 s / +5 s |
+| `Ctrl+Left` / `Ctrl+Right` | Previous / next track |
+| `Up` / `Down` | Volume +5 / -5 |
+| `Ctrl+L` | Show / hide lyrics (clicking the cover or title does the same) |
+| `Ctrl+T` | Next theme |
+| `Ctrl+R` | Re-read the current theme file |
+
+Below 980 px of window width the queue column is hidden; a button in the bar swaps it in for the main area.
+
 ## Themes
 The desktop app reads user themes from `themes/<name>.json` in the config folder (`~/.config/cmusic/themes/` on Linux). Copy a preset from `themes/` in this repo to start. A file may hold only the keys it changes; unknown keys or bad values are reported in the status line and the previous look stays.
 

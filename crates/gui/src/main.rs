@@ -3,10 +3,11 @@ mod icons;
 mod theme;
 mod view;
 
-use app::{Message, Out, State};
+use app::{Message, Out, Scroll, State};
 use cmusic_core::engine::{self, Handle, Options};
 use cmusic_core::{persist, Update};
 use iced::futures::stream;
+use iced::widget::operation;
 use iced::{event, keyboard, window, Size, Subscription, Task};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -72,18 +73,33 @@ fn engine_stream() -> impl iced::futures::Stream<Item = Message> {
 fn subscription(_: &State) -> Subscription<Message> {
     Subscription::batch([
         Subscription::run(engine_stream),
-        // Status::Ignored means no text input took the key.
-        event::listen_with(|e, status, _| match e {
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(keyboard::key::Named::Space),
-                ..
-            }) if status == event::Status::Ignored => Some(Message::TogglePause),
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(c),
-                modifiers,
-                ..
-            }) if modifiers.control() && c.as_str() == "r" => Some(Message::ReloadTheme),
-            _ => None,
+        event::listen_with(|e, status, _| {
+            let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = e
+            else {
+                return None;
+            };
+            use keyboard::key::Named::*;
+            use keyboard::Key::{Character, Named};
+            let ctrl = modifiers.control();
+            match key.as_ref() {
+                // Work even while a text input has focus.
+                Character("f") if ctrl => Some(Message::FocusSearch),
+                Character("r") if ctrl => Some(Message::ReloadTheme),
+                Character("t") if ctrl => Some(Message::CycleTheme),
+                Character("l") if ctrl => Some(Message::ToggleLyrics),
+                // Status::Ignored means no text input took the key.
+                _ if status != event::Status::Ignored => None,
+                Character("/") => Some(Message::FocusSearch),
+                Named(Space) => Some(Message::TogglePause),
+                Named(Escape) => Some(Message::Escape),
+                Named(ArrowLeft) if ctrl => Some(Message::Prev),
+                Named(ArrowRight) if ctrl => Some(Message::Next),
+                Named(ArrowLeft) => Some(Message::SeekBy(-5.0)),
+                Named(ArrowRight) => Some(Message::SeekBy(5.0)),
+                Named(ArrowUp) => Some(Message::VolumeBy(5)),
+                Named(ArrowDown) => Some(Message::VolumeBy(-5)),
+                _ => None,
+            }
         }),
         window::resize_events().map(|(_, s)| Message::Resized(s)),
         window::close_requests().map(|_| Message::CloseRequested),
@@ -92,11 +108,15 @@ fn subscription(_: &State) -> Subscription<Message> {
 
 fn update(app: &mut State, msg: Message) -> Task<Message> {
     let follow = demo_followups(&msg);
+    app.now = std::time::Instant::now();
     let Out {
         commands,
         art,
         closing,
         stopped,
+        focus_search,
+        scroll,
+        notice_gen,
     } = app.update(msg);
     if let Some(h) = HANDLE.get() {
         for c in commands {
@@ -115,6 +135,31 @@ fn update(app: &mut State, msg: Message) -> Task<Message> {
             })
         })
         .collect();
+    if focus_search {
+        tasks.push(operation::focus(app::SEARCH));
+    }
+    match scroll {
+        Some(Scroll::ListTop) => {
+            tasks.push(operation::snap_to(
+                app::LIST,
+                operation::RelativeOffset::START,
+            ));
+        }
+        Some(Scroll::Lyrics(y)) => tasks.push(operation::scroll_to(
+            app::LYRICS,
+            operation::AbsoluteOffset {
+                x: None,
+                y: Some(y),
+            },
+        )),
+        None => {}
+    }
+    if let Some(g) = notice_gen {
+        tasks.push(
+            Task::future(tokio::time::sleep(Duration::from_secs(5)))
+                .map(move |_| Message::ClearNotice(g)),
+        );
+    }
     if closing {
         save_prefs(app.size, &app.theme_name);
         // Wait for the engine to save and stop, but not forever.

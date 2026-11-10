@@ -1,4 +1,4 @@
-use crate::app::{thumb, Message, State};
+use crate::app::{thumb, Message, State, LIST, LYRICS, LYRIC_LH, NARROW, SEARCH};
 use crate::icons;
 use crate::theme::Look;
 use cmusic_core::{lyrics, Item, PageRequest, Repeat, Status, Track};
@@ -26,17 +26,27 @@ const HEAD: f32 = 36.0;
 /// Width of the duration column and of the three row action buttons.
 const DUR: f32 = 44.0;
 const ACT: f32 = 28.0;
+const SIDEBAR_W: f32 = 180.0;
+const QUEUE_W: f32 = 280.0;
 
 pub fn view(s: &State) -> Element<'_, Message> {
     let l = s.look;
-    let content = column![
+    // Narrow windows have no room for a third column: the queue swaps in for the main area.
+    let middle = if narrow(s) && s.queue_open && s.login.is_none() {
+        row![panel(l, queue(s, main_w(s))).width(Fill)]
+    } else if narrow(s) {
+        row![panel(l, main_area(s)).width(Fill)]
+    } else {
         row![
-            panel(l, sidebar(s)),
             panel(l, main_area(s)).width(Fill),
-            panel(l, queue(s))
+            panel(l, queue(s, QUEUE_W))
         ]
         .spacing(l.gap)
-        .height(Fill),
+    };
+    let content = column![
+        row![panel(l, sidebar(s)), middle.width(Fill)]
+            .spacing(l.gap)
+            .height(Fill),
         panel(l, bar(s)),
     ]
     .spacing(l.gap)
@@ -55,6 +65,21 @@ pub fn view(s: &State) -> Element<'_, Message> {
         container(content).width(Fill).height(Fill).style(scrim(l)),
     ]
     .into()
+}
+
+fn narrow(s: &State) -> bool {
+    s.size.width < NARROW
+}
+
+/// Inner width of the main panel (also what the queue gets when it replaces it): the window
+/// minus outer padding, panel paddings, gaps and the sidebar (and the queue column when shown).
+fn main_w(s: &State) -> f32 {
+    let g = s.look.gap;
+    if narrow(s) {
+        s.size.width - 7.0 * g - SIDEBAR_W
+    } else {
+        s.size.width - 10.0 * g - SIDEBAR_W - QUEUE_W
+    }
 }
 
 fn panel<'a>(
@@ -87,13 +112,34 @@ const RAIL: f32 = 16.0;
 
 /// Shortens `t` to fit `width` px at base text size `base` (iced has no ellipsis), cutting on a
 /// char boundary and ending with "...".
-// ponytail: width is estimated at 0.5 em per char; real text measurement is the upgrade.
+// ponytail: widths are per-class estimates of a DejaVu Sans (the usual Linux default), not measured; the text columns
+// are clipped so a misjudged glyph can never overlap its neighbour. Real measurement (the
+// advanced text API) is the upgrade.
 fn fit(l: Look, t: &str, width: f32, base: f32) -> String {
-    let budget = (width / (sz(l, base) * 0.5)).max(4.0) as usize;
-    if t.chars().count() <= budget {
+    let em = sz(l, base);
+    let w = |c: char| {
+        em * match c {
+            'i' | 'j' | 'l' | 'I' | '.' | ',' | ':' | ';' | '\'' | '|' | '!' => 0.3,
+            ' ' => 0.33,
+            'f' | 't' | 'r' | '(' | ')' | '[' | ']' | '-' | '/' => 0.4,
+            'm' | 'w' | 'M' | 'W' | '@' => 0.9,
+            'A'..='Z' | '&' => 0.7,
+            '0'..='9' => 0.64,
+            c if c as u32 >= 0x2e80 => 1.0,
+            _ => 0.62,
+        }
+    };
+    if t.chars().map(w).sum::<f32>() <= width {
         return t.to_string();
     }
-    let head: String = t.chars().take(budget - 3).collect();
+    let room = width - 3.0 * em * 0.3;
+    let head: String = t
+        .chars()
+        .scan(0.0, |used, c| {
+            *used += w(c);
+            (*used <= room).then_some(c)
+        })
+        .collect();
     format!("{}...", head.trim_end())
 }
 
@@ -125,17 +171,17 @@ fn art_mark<'a>(
     size: u32,
     playing: bool,
 ) -> Element<'a, Message> {
-    let l = s.look;
     let a = art(s, url, size);
     if !playing {
         return a;
     }
     stack![
         a,
-        container(ico(icons::equalizer(), size as f32 * 0.5, l.accent_a))
+        container(ico(icons::equalizer(), size as f32 * 0.5, Color::WHITE))
             .center(size)
             .style(move |_| container::Style {
-                background: Some(tint(l.ink, 0.6).into()),
+                // Dark whatever the theme or the cover, so the glyph always reads.
+                background: Some(tint(Color::BLACK, 0.6).into()),
                 border: border::rounded(size as f32 / 5.0),
                 ..Default::default()
             })
@@ -197,6 +243,7 @@ fn sidebar(s: &State) -> Element<'_, Message> {
     };
     let search = stack![
         text_input("Search", &s.search)
+            .id(SEARCH)
             .on_input(Message::SearchInput)
             .on_submit(Message::SearchSubmit)
             .padding(Padding {
@@ -232,7 +279,7 @@ fn sidebar(s: &State) -> Element<'_, Message> {
         .style(pill(l, false)),
     ]
     .spacing(4)
-    .width(180)
+    .width(SIDEBAR_W)
     .into()
 }
 
@@ -286,19 +333,20 @@ fn main_area(s: &State) -> Element<'_, Message> {
         (None, Some((_, p))) => p.title.clone(),
         _ => String::new(),
     };
-    let can_back = !s.history.is_empty();
-    let back = ibtn(
-        l,
-        icons::chevron_left(),
-        HEAD - 4.0,
-        "Back",
-        can_back.then_some(Message::Back),
-        row_button(l, false),
-        if can_back { l.text } else { tint(l.text, 0.3) },
-    );
-    // Window minus panels, sidebar, queue, art, duration, three buttons and the gaps between.
-    let avail =
-        (s.size.width - 10.0 * l.gap - 460.0 - 5.0 * l.pad - RAIL - 250.0 * l.font_scale).max(80.0);
+    let back = (!s.history.is_empty()).then(|| {
+        ibtn(
+            l,
+            icons::chevron_left(),
+            HEAD - 4.0,
+            "Back",
+            Some(Message::Back),
+            row_button(l, false),
+            l.text,
+        )
+    });
+    // Panel inner width minus the scrollbar, row paddings (list and button), art, the gaps
+    // around the text and the duration column.
+    let avail = (main_w(s) - RAIL - 6.0 * l.pad - 40.0 - DUR).max(80.0);
     let body: Element<_> = match (&s.awaiting, &s.current) {
         (Some(r), _) => hint(l, Some(request_name(r)), "Loading..."),
         (None, Some((_, p))) if !p.items.is_empty() => {
@@ -307,6 +355,7 @@ fn main_area(s: &State) -> Element<'_, Message> {
                 rows = rows.push(item_row(s, i, it, avail));
             }
             let list = scrollable(rows.padding([0.0, l.pad]))
+                .id(LIST)
                 .spacing(6)
                 .style(scroll(l))
                 .height(Fill)
@@ -330,7 +379,9 @@ fn main_area(s: &State) -> Element<'_, Message> {
         ),
     };
     column![
-        row![back, head(l, title, None)]
+        row![]
+            .extend(back)
+            .push(head(l, title, None))
             .spacing(l.pad)
             .align_y(Center),
         body
@@ -346,7 +397,7 @@ fn list_row<'a>(
     l: Look,
     body: impl Into<Element<'a, Message>>,
     press: Message,
-    actions: Option<(Element<'a, Message>, f32)>,
+    actions: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let b = button(body)
         .on_press(press)
@@ -356,18 +407,27 @@ fn list_row<'a>(
         .style(row_button(l, false));
     match actions {
         None => b.into(),
-        // `right` is what stays visible at the end of the row (duration), so actions sit left of it.
-        Some((a, right)) => hover(
+        // The actions sit in an opaque-ish pill at the right end, over the duration and the end
+        // of the title, so nothing shows through. The buttons capture their own clicks.
+        Some(a) => hover(
             b,
-            container(a)
-                .width(Fill)
-                .height(Fill)
-                .align_x(Right)
-                .align_y(Center)
-                .padding(Padding {
-                    right: right + l.pad,
-                    ..Padding::ZERO
-                }),
+            container(container(a).padding(2).style(move |_| {
+                container::Style {
+                    background: Some(tint(l.ink, 0.88).into()),
+                    border: border::rounded(l.radius_row)
+                        .color(l.control_border)
+                        .width(1),
+                    ..Default::default()
+                }
+            }))
+            .width(Fill)
+            .height(Fill)
+            .align_x(Right)
+            .align_y(Center)
+            .padding(Padding {
+                right: l.pad,
+                ..Padding::ZERO
+            }),
         ),
     }
 }
@@ -393,13 +453,24 @@ fn item_row<'a>(s: &'a State, i: usize, it: &'a Item, w: f32) -> Element<'a, Mes
         ),
     };
     let playing = matches!(it, Item::Track(t) if Some(&t.video_id) == s.snapshot.current().map(|c| &c.video_id));
+    // Non-track rows have no duration column.
+    let w = if matches!(it, Item::Track(_)) {
+        w
+    } else {
+        w + DUR
+    };
     let mut name = line(l, fit(l, title, w, B));
     if playing {
         name = name.color(l.accent_a);
     }
     let mut body = row![
         art_mark(s, thumb(it).as_ref(), 40, playing),
-        column![name, dim(l, fit(l, sub, w, S)).wrapping(Wrapping::None)].width(Fill)
+        container(column![
+            name,
+            dim(l, fit(l, sub, w, S)).wrapping(Wrapping::None)
+        ])
+        .width(Fill)
+        .clip(true)
     ]
     .spacing(l.pad)
     .align_y(Center);
@@ -451,7 +522,7 @@ fn item_row<'a>(s: &'a State, i: usize, it: &'a Item, w: f32) -> Element<'a, Mes
         ),
     ]
     .spacing(2);
-    list_row(l, body, press, Some((actions.into(), DUR)))
+    list_row(l, body, press, Some(actions.into()))
 }
 
 fn lyrics_view(s: &State) -> Element<'_, Message> {
@@ -459,17 +530,31 @@ fn lyrics_view(s: &State) -> Element<'_, Message> {
     let body: Element<_> = match s.current_lyrics() {
         Some(ly) if !ly.lines.is_empty() => {
             let cur = lyrics::current_line(ly, s.snapshot.position_secs);
-            let mut c = column![].spacing(6);
+            // Plain lyrics have no times: all lines at normal strength, none highlighted.
+            let synced = ly.lines.iter().any(|(t, _)| t.is_some());
+            let w = main_w(s) - RAIL - 2.0 * l.pad;
+            // Fixed line height (no wrapping) so the auto-scroll offset is exact.
+            let mut c = column![];
             for (i, (_, t)) in ly.lines.iter().enumerate() {
-                let t = text(t.as_str()).size(sz(l, 18.0));
-                c = c.push(if Some(i) == cur {
-                    t.size(sz(l, 21.0)).color(tint(l.text, 1.0))
-                } else {
-                    t.color(tint(l.text_dim, 0.45))
-                });
+                let t = text(fit(l, t, w, 21.0))
+                    .size(sz(l, 18.0))
+                    .wrapping(Wrapping::None);
+                let t = match (synced, Some(i) == cur) {
+                    (true, true) => t.size(sz(l, 21.0)).color(l.accent_a),
+                    (true, false) => t.color(tint(l.text_dim, 0.55)),
+                    _ => t.color(l.text),
+                };
+                c = c.push(
+                    container(t)
+                        .width(Fill)
+                        .height(LYRIC_LH * l.font_scale)
+                        .center_x(Fill)
+                        .align_y(Center),
+                );
             }
-            // ponytail: no auto-scroll to the current line; add scrollable::scroll_to if wanted.
             scrollable(c.padding(l.pad))
+                .id(LYRICS)
+                .on_scroll(|v| Message::LyricsScrolled(v.bounds().height))
                 .spacing(6)
                 .style(scroll(l))
                 .height(Fill)
@@ -506,10 +591,7 @@ fn login(s: &State) -> Element<'_, Message> {
             .padding([8, 14])
             .size(sz(l, B))
             .style(field(l)),
-        dim(
-            l,
-            "DevTools > Network > any browse request > Cookie request header"
-        ),
+        dim(l, "DevTools > Network > a request > Cookie header"),
         row![
             button(txt(l, "Use pasted cookie"))
                 .on_press(Message::UseCookie)
@@ -522,16 +604,16 @@ fn login(s: &State) -> Element<'_, Message> {
     ]
     .spacing(l.pad + 4.0)
     .width(Fill)
-    .max_width(420);
+    .max_width(480);
     container(form).center(Fill).padding(l.pad).into()
 }
 
-fn queue(s: &State) -> Element<'_, Message> {
+fn queue(s: &State, qw: f32) -> Element<'_, Message> {
     let l = s.look;
     let snap = &s.snapshot;
     let mut c = column![].spacing(2);
-    // Queue column minus art, the remove button, row paddings and the rail.
-    let w = 280.0 - 36.0 - ACT - 3.0 * l.pad - RAIL;
+    // Queue column minus art, row paddings and the rail.
+    let w = qw - 36.0 - 3.0 * l.pad - RAIL;
     for (i, t) in snap.queue.iter().enumerate().take(MAX_ROWS) {
         let cur = snap.cursor == Some(i);
         let mut name = line(l, fit(l, &t.title, w, B));
@@ -540,11 +622,12 @@ fn queue(s: &State) -> Element<'_, Message> {
         }
         let body = row![
             art_mark(s, t.thumbnail_url.as_ref(), 36, cur),
-            column![
+            container(column![
                 name,
                 dim(l, fit(l, &t.artists, w, S)).wrapping(Wrapping::None)
-            ]
+            ])
             .width(Fill)
+            .clip(true)
         ]
         .spacing(l.pad)
         .align_y(Center);
@@ -558,10 +641,10 @@ fn queue(s: &State) -> Element<'_, Message> {
             l.text,
         );
         c = c.push(
-            container(list_row(l, body, Message::Jump(i), Some((x, 0.0))))
+            container(list_row(l, body, Message::Jump(i), Some(x)))
                 .width(Fill)
                 .style(move |_| container::Style {
-                    background: cur.then(|| tint(l.control, 0.14 + l.control.a).into()),
+                    background: cur.then(|| selected(l).into()),
                     border: border::rounded(l.radius_row)
                         .color(if cur {
                             tint(l.accent_a, 0.7)
@@ -597,7 +680,7 @@ fn queue(s: &State) -> Element<'_, Message> {
         body,
     ]
     .spacing(l.pad)
-    .width(280)
+    .width(qw)
     .into()
 }
 
@@ -613,12 +696,12 @@ fn bar(s: &State) -> Element<'_, Message> {
         Status::Error => "Error",
         _ => "",
     };
-    const W: f32 = 220.0;
+    let w = if narrow(s) { 150.0 } else { 220.0 };
     // Fixed three lines so a notice never moves anything.
     let info = column![
         line(
             l,
-            fit(l, cur.map_or("Nothing playing", |t| t.title.as_str()), W, B)
+            fit(l, cur.map_or("Nothing playing", |t| t.title.as_str()), w, B)
         ),
         dim(
             l,
@@ -629,7 +712,7 @@ fn bar(s: &State) -> Element<'_, Message> {
                     ("", None) => "",
                     (st, _) => st,
                 },
-                W,
+                w,
                 S
             )
         )
@@ -643,14 +726,14 @@ fn bar(s: &State) -> Element<'_, Message> {
                     .as_deref()
                     .or(snap.last_error.as_deref())
                     .unwrap_or(""),
-                W,
+                w,
                 S
             )
         )
         .wrapping(Wrapping::None)
         .height(sz(l, S) * 1.4),
     ];
-    let info = container(info).width(W).clip(true);
+    let info = container(info).width(w).clip(true);
     let playing = matches!(snap.status, Status::Playing | Status::Buffering);
     let max = snap.duration_secs.max(1.0);
     let pos = s.drag.unwrap_or(snap.position_secs).min(max);
@@ -715,7 +798,7 @@ fn bar(s: &State) -> Element<'_, Message> {
         Repeat::All => ("Repeat: all", icons::repeat()),
         Repeat::One => ("Repeat: one", icons::repeat_one()),
     };
-    let toggles = row![
+    let mut toggles = row![
         tog(icons::shuffle(), "Shuffle", snap.shuffle, Message::Shuffle),
         tog(
             repeat.1,
@@ -755,6 +838,14 @@ fn bar(s: &State) -> Element<'_, Message> {
     ]
     .spacing(6)
     .align_y(Center);
+    if narrow(s) {
+        toggles = toggles.push(tog(
+            icons::list(),
+            "Queue",
+            s.queue_open,
+            Message::ToggleQueue,
+        ));
+    }
     let volume = row![
         ico(icons::volume(), 16.0, l.text_dim),
         slider(0..=100u8, snap.volume, Message::Volume)
@@ -763,9 +854,17 @@ fn bar(s: &State) -> Element<'_, Message> {
     ]
     .spacing(l.pad)
     .align_y(Center);
+    // Art and title open the lyrics.
+    let now = button(
+        row![art(s, cur.and_then(|t| t.thumbnail_url.as_ref()), 64), info]
+            .spacing(l.pad + 4.0)
+            .align_y(Center),
+    )
+    .on_press(Message::ToggleLyrics)
+    .padding(0)
+    .style(row_button(l, false));
     row![
-        art(s, cur.and_then(|t| t.thumbnail_url.as_ref()), 64),
-        info,
+        now,
         column![transport, seek]
             .spacing(4)
             .align_x(Center)
@@ -773,7 +872,7 @@ fn bar(s: &State) -> Element<'_, Message> {
         column![toggles, volume]
             .spacing(l.pad)
             .align_x(Right)
-            .width(250),
+            .width(if narrow(s) { 290 } else { 250 }),
     ]
     .spacing(l.pad + 4.0)
     .align_y(Center)
@@ -899,16 +998,26 @@ fn pill(l: Look, on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
-/// List row: invisible until hovered. `on` marks the current queue entry.
+/// Fill of the selected row (current queue entry, open section): a light accent tint, so the
+/// accent title on it stays readable in dark and light looks alike.
+fn selected(l: Look) -> Color {
+    tint(l.accent_a, 0.16)
+}
+
+/// List row: invisible until hovered. `on` marks the open sidebar section.
 fn row_button(l: Look, on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {
         let a = match status {
             button::Status::Hovered => 0.10,
             button::Status::Pressed => 0.16,
             _ => 0.0,
-        } + if on { 0.14 } else { 0.0 };
+        };
         button::Style {
-            background: (a > 0.0).then(|| tint(l.control, a).into()),
+            background: if on {
+                Some(selected(l).into())
+            } else {
+                (a > 0.0).then(|| tint(l.control, a).into())
+            },
             text_color: l.text,
             border: border::rounded(l.radius_row)
                 .color(if on {
@@ -987,19 +1096,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fit_cuts_on_char_boundaries() {
+    fn fit_cuts_on_char_boundaries_and_keeps_what_fits() {
         let l = Look::default();
-        // 96 px at 16 px text is a 12 char budget.
-        assert_eq!(fit(l, "short", 96.0, 16.0), "short");
-        assert_eq!(fit(l, "123456789012", 96.0, 16.0), "123456789012");
-        assert_eq!(fit(l, "1234567890123", 96.0, 16.0), "123456789...");
-        let jp = "ñandú canción mañana".to_string();
-        let out = fit(l, &jp, 96.0, 16.0);
-        assert_eq!(out.chars().count(), 12);
+        assert_eq!(fit(l, "short", 200.0, 16.0), "short");
+        let long = "Waiting For the End (Official Music Video) [4K Upgrade]";
+        let out = fit(l, long, 300.0, 16.0);
+        assert!(out.ends_with("...") && out.len() < long.len());
+        assert!(fit(l, long, 3000.0, 16.0) == long);
+        // Multibyte text is cut on a char boundary and never panics.
+        let out = fit(l, "ñandú canción mañana", 80.0, 16.0);
         assert!(out.ends_with("..."));
-        assert_eq!(
-            fit(l, "日本語日本語日本語日本語日本語", 96.0, 16.0),
-            "日本語日本語日本語..."
+        let cjk = fit(l, "日本語日本語日本語日本語日本語", 80.0, 16.0);
+        assert!(cjk.starts_with("日本語") && cjk.ends_with("..."));
+        // Narrow glyphs buy more characters than wide ones in the same width.
+        assert!(
+            fit(l, &"i".repeat(60), 200.0, 16.0).len() > fit(l, &"W".repeat(60), 200.0, 16.0).len()
         );
     }
 }

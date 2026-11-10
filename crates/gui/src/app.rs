@@ -3,11 +3,23 @@
 
 use crate::theme::{self, Look};
 use cmusic_core::{
-    Command, CookieSource, Item, Lyrics, Page, PageRequest, Rating, Snapshot, Track, Update,
+    lyrics, Command, CookieSource, Item, Lyrics, Page, PageRequest, Rating, Snapshot, Track, Update,
 };
 use iced::widget::image;
 use iced::Size;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+/// Widget ids the wrapper needs to aim a focus or scroll operation at.
+pub const SEARCH: &str = "search";
+pub const LYRICS: &str = "lyrics";
+pub const LIST: &str = "list";
+/// Window width below which the queue is a toggled view instead of a column.
+pub const NARROW: f32 = 980.0;
+/// Height of one lyrics line at font scale 1; fixed so the scroll offset is exact.
+pub const LYRIC_LH: f32 = 34.0;
+/// A manual scroll in the lyrics view pauses auto-scroll for this long.
+const USER_SCROLL_HOLD: Duration = Duration::from_secs(5);
 
 /// A tiny, heavily blurred copy of the art; the renderer stretches it over the window.
 // ponytail: runs inside update (a few ms on a 64 px image); move to a Task if it ever shows.
@@ -88,11 +100,20 @@ pub enum Message {
     Prev,
     SeekChanged(f64),
     SeekReleased,
+    SeekBy(f64),
+    VolumeBy(i8),
     Volume(u8),
     Shuffle,
     Repeat,
     Normalize,
     ToggleLyrics,
+    ToggleQueue,
+    FocusSearch,
+    Escape,
+    /// Viewport height of the lyrics scrollable, sent whenever its offset changes.
+    LyricsScrolled(f32),
+    /// Clears the notice if it is still the one with this generation.
+    ClearNotice(u64),
     Jump(usize),
     Remove(usize),
     ClearQueue,
@@ -123,6 +144,17 @@ pub struct Out {
     pub closing: bool,
     /// The engine stream ended: exit now.
     pub stopped: bool,
+    pub focus_search: bool,
+    pub scroll: Option<Scroll>,
+    /// A notice was set: send `ClearNotice` with this generation after a delay.
+    pub notice_gen: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Scroll {
+    ListTop,
+    /// Absolute offset in px for the lyrics scrollable.
+    Lyrics(f32),
 }
 
 pub struct State {
@@ -134,6 +166,16 @@ pub struct State {
     pub history: Vec<(PageRequest, Page)>,
     pub lyrics: Option<(String, Option<Lyrics>)>,
     pub show_lyrics: bool,
+    /// Narrow windows only: the queue replaces the main area.
+    pub queue_open: bool,
+    /// Set by the wrapper before each update, so `update` stays deterministic.
+    pub now: Instant,
+    notice_gen: u64,
+    lyric_line: Option<usize>,
+    user_scrolled: Option<Instant>,
+    /// We issued a scroll and its `on_scroll` echo has not arrived yet.
+    scroll_pending: bool,
+    lyrics_h: f32,
     pub login: Option<Login>,
     pub notice: Option<String>,
     /// Set at startup from the cookie file, then by the "Logged in" notice and `AuthRequired`.
@@ -164,6 +206,13 @@ impl State {
             history: Vec::new(),
             lyrics: None,
             show_lyrics: false,
+            queue_open: false,
+            now: Instant::now(),
+            notice_gen: 0,
+            lyric_line: None,
+            user_scrolled: None,
+            scroll_pending: false,
+            lyrics_h: 0.0,
             login: None,
             notice: None,
             logged_in: false,
@@ -179,6 +228,20 @@ impl State {
     }
 
     pub fn update(&mut self, msg: Message) -> Out {
+        let gen = self.notice_gen;
+        let mut out = self.step(msg);
+        if self.notice_gen != gen {
+            out.notice_gen = Some(self.notice_gen);
+        }
+        out
+    }
+
+    fn set_notice(&mut self, n: String) {
+        self.notice = Some(n);
+        self.notice_gen += 1;
+    }
+
+    fn step(&mut self, msg: Message) -> Out {
         let mut out = Out::default();
         match msg {
             Message::Engine(u) => return self.engine(u),
@@ -191,12 +254,37 @@ impl State {
                 }
             }
             Message::Open(r) => self.fetch(r, &mut out),
-            Message::Back => {
-                if let Some(prev) = self.history.pop() {
-                    self.current = Some(prev);
-                    self.awaiting = None;
+            Message::Back => self.back(&mut out),
+            Message::Escape => {
+                if self.login.is_some() {
+                    self.login = None;
+                } else if self.show_lyrics {
                     self.show_lyrics = false;
+                } else if self.queue_open {
+                    self.queue_open = false;
+                } else {
+                    self.back(&mut out);
                 }
+            }
+            Message::FocusSearch => out.focus_search = true,
+            Message::ToggleQueue => self.queue_open = !self.queue_open,
+            Message::LyricsScrolled(h) => {
+                self.lyrics_h = h;
+                if self.scroll_pending {
+                    self.scroll_pending = false;
+                } else {
+                    self.user_scrolled = Some(self.now);
+                }
+            }
+            Message::ClearNotice(g) => {
+                if g == self.notice_gen {
+                    self.notice = None;
+                }
+            }
+            Message::SeekBy(d) => out.commands.push(Command::SeekBy(d)),
+            Message::VolumeBy(d) => {
+                let v = (i16::from(self.snapshot.volume) + i16::from(d)).clamp(0, 100) as u8;
+                out.commands.push(Command::SetVolume(v));
             }
             Message::PlayRow(i) => {
                 if let Some((_, page)) = &self.current {
@@ -212,8 +300,20 @@ impl State {
                         .iter()
                         .filter(|it| matches!(it, Item::Track(_)))
                         .count();
-                    if matches!(page.items.get(i), Some(Item::Track(_))) {
-                        out.commands.push(Command::PlayTracks { tracks, start });
+                    match page.items.get(i) {
+                        // The playing track: pause/resume instead of rebuilding the queue.
+                        Some(Item::Track(t))
+                            if self
+                                .snapshot
+                                .current()
+                                .is_some_and(|c| c.video_id == t.video_id) =>
+                        {
+                            out.commands.push(Command::TogglePause);
+                        }
+                        Some(Item::Track(_)) => {
+                            out.commands.push(Command::PlayTracks { tracks, start });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -241,7 +341,11 @@ impl State {
             Message::Shuffle => out.commands.push(Command::ToggleShuffle),
             Message::Repeat => out.commands.push(Command::CycleRepeat),
             Message::Normalize => out.commands.push(Command::ToggleNormalize),
-            Message::ToggleLyrics => self.show_lyrics = !self.show_lyrics,
+            Message::ToggleLyrics => {
+                self.show_lyrics = !self.show_lyrics;
+                self.lyric_line = None;
+                self.lyric_scroll(&mut out);
+            }
             Message::Jump(i) => out.commands.push(Command::JumpTo(i)),
             Message::Remove(i) => out.commands.push(Command::RemoveFromQueue(i)),
             Message::ClearQueue => out.commands.push(Command::ClearQueue),
@@ -296,12 +400,61 @@ impl State {
         match loaded {
             Ok(look) => {
                 self.look = look;
-                self.notice = Some(format!("Theme: {}", self.theme_name));
+                self.set_notice(format!("Theme: {}", self.theme_name));
                 self.backdrop = None;
                 self.refresh_backdrop();
             }
-            Err(e) => self.notice = Some(e),
+            Err(e) => self.set_notice(e),
         }
+    }
+
+    fn back(&mut self, out: &mut Out) {
+        if let Some(prev) = self.history.pop() {
+            self.current = Some(prev);
+            self.awaiting = None;
+            self.show_lyrics = false;
+            // The list widget keeps its scroll offset across pages.
+            out.scroll = Some(Scroll::ListTop);
+        }
+    }
+
+    /// Asks for the lyrics view to centre the current line when it just changed, unless the
+    /// user scrolled by hand a moment ago.
+    fn lyric_scroll(&mut self, out: &mut Out) {
+        if !self.show_lyrics || self.login.is_some() {
+            return;
+        }
+        let Some(i) = self
+            .current_lyrics()
+            .and_then(|ly| lyrics::current_line(ly, self.snapshot.position_secs))
+        else {
+            return;
+        };
+        if self.lyric_line == Some(i) {
+            return;
+        }
+        self.lyric_line = Some(i);
+        if self
+            .user_scrolled
+            .is_some_and(|t| self.now.duration_since(t) < USER_SCROLL_HOLD)
+        {
+            return;
+        }
+        let l = self.look;
+        // Window minus outer and panel padding, the bar, the header and the content padding.
+        let est = self.size.height - 7.0 * l.gap - 64.0 - 36.0 - l.pad;
+        let h = if self.lyrics_h > 0.0 {
+            self.lyrics_h
+        } else {
+            est
+        };
+        let lh = LYRIC_LH * l.font_scale;
+        // ponytail: if the on_scroll echo never comes (offset clamped at the end) the next manual
+        // scroll is not recognised as manual; harmless.
+        self.scroll_pending = true;
+        out.scroll = Some(Scroll::Lyrics(
+            ((i as f32 + 0.5) * lh + l.pad - h / 2.0).max(0.0),
+        ));
     }
 
     fn fetch(&mut self, r: PageRequest, out: &mut Out) {
@@ -320,6 +473,7 @@ impl State {
                 }
                 self.snapshot = s;
                 self.refresh_backdrop();
+                self.lyric_scroll(&mut out);
             }
             Update::Page { request, result } => {
                 if self.awaiting.as_ref() != Some(&request) {
@@ -344,10 +498,14 @@ impl State {
                         }
                         self.show_lyrics = false;
                     }
-                    Err(e) => self.notice = Some(e),
+                    Err(e) => self.set_notice(e),
                 }
             }
-            Update::Lyrics { video_id, lyrics } => self.lyrics = Some((video_id, lyrics)),
+            Update::Lyrics { video_id, lyrics } => {
+                self.lyrics = Some((video_id, lyrics));
+                self.lyric_line = None;
+                self.lyric_scroll(&mut out);
+            }
             Update::AuthRequired(m) => {
                 self.logged_in = false;
                 let l = self.login.get_or_insert_with(Login::default);
@@ -358,7 +516,7 @@ impl State {
                     self.login = None;
                     self.logged_in = true;
                 }
-                self.notice = Some(n);
+                self.set_notice(n);
             }
         }
         out
@@ -602,6 +760,125 @@ mod tests {
         assert_eq!(trim_bars(full.clone()), full);
         let wide = enc(::image::RgbImage::new(40, 20));
         assert_eq!(trim_bars(wide.clone()), wide);
+    }
+
+    fn playing(s: &mut State, id: &str, pos: f64) {
+        s.update(Message::Engine(Update::Player(Snapshot {
+            queue: vec![track(id)],
+            cursor: Some(0),
+            position_secs: pos,
+            volume: 98,
+            ..Snapshot::default()
+        })));
+    }
+
+    #[test]
+    fn clicking_the_playing_track_toggles_pause() {
+        let mut s = state();
+        s.update(Message::Open(PageRequest::LikedSongs));
+        s.update(page_update(
+            PageRequest::LikedSongs,
+            vec![Item::Track(track("a")), Item::Track(track("b"))],
+        ));
+        playing(&mut s, "b", 0.0);
+        assert_eq!(
+            s.update(Message::PlayRow(1)).commands,
+            vec![Command::TogglePause]
+        );
+        assert_eq!(s.update(Message::PlayRow(0)).commands.len(), 1);
+        assert!(matches!(
+            s.update(Message::PlayRow(0)).commands[0],
+            Command::PlayTracks { start: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn escape_closes_login_then_lyrics_then_goes_back() {
+        let mut s = state();
+        s.update(Message::Open(PageRequest::LikedSongs));
+        s.update(page_update(PageRequest::LikedSongs, vec![]));
+        s.update(Message::Open(PageRequest::LibrarySongs));
+        s.update(page_update(PageRequest::LibrarySongs, vec![]));
+        s.login = Some(Login::default());
+        s.show_lyrics = true;
+        s.update(Message::Escape);
+        assert!(s.login.is_none() && s.show_lyrics);
+        s.update(Message::Escape);
+        assert!(!s.show_lyrics && s.history.len() == 1);
+        let out = s.update(Message::Escape);
+        assert!(s.history.is_empty());
+        assert_eq!(out.scroll, Some(Scroll::ListTop));
+        assert_eq!(s.current.as_ref().unwrap().0, PageRequest::LikedSongs);
+    }
+
+    #[test]
+    fn keys_map_to_commands() {
+        let mut s = state();
+        playing(&mut s, "a", 0.0);
+        assert_eq!(
+            s.update(Message::SeekBy(-5.0)).commands,
+            vec![Command::SeekBy(-5.0)]
+        );
+        assert_eq!(
+            s.update(Message::VolumeBy(5)).commands,
+            vec![Command::SetVolume(100)]
+        );
+        assert_eq!(
+            s.update(Message::VolumeBy(-5)).commands,
+            vec![Command::SetVolume(93)]
+        );
+        assert!(s.update(Message::FocusSearch).focus_search);
+    }
+
+    #[test]
+    fn notice_clears_only_for_its_own_generation() {
+        let mut s = state();
+        let n = |s: &mut State, t: &str| {
+            s.update(Message::Engine(Update::Notice(t.into())))
+                .notice_gen
+                .unwrap()
+        };
+        let (a, b) = (n(&mut s, "one"), n(&mut s, "two"));
+        assert_ne!(a, b);
+        s.update(Message::ClearNotice(a));
+        assert_eq!(s.notice.as_deref(), Some("two"));
+        s.update(Message::ClearNotice(b));
+        assert_eq!(s.notice, None);
+    }
+
+    #[test]
+    fn lyrics_follow_the_current_line_unless_the_user_scrolled() {
+        let mut s = state();
+        s.show_lyrics = true;
+        let lines = (0..20)
+            .map(|i| (Some(i as f64 * 10.0), format!("l{i}")))
+            .collect();
+        playing(&mut s, "a", 0.0);
+        let at = |s: &mut State, pos: f64| {
+            s.update(Message::Engine(Update::Player(Snapshot {
+                position_secs: pos,
+                ..s.snapshot.clone()
+            })))
+            .scroll
+        };
+        let out = s.update(Message::Engine(Update::Lyrics {
+            video_id: "a".into(),
+            lyrics: Some(Lyrics { lines }),
+        }));
+        assert_eq!(out.scroll, Some(Scroll::Lyrics(0.0)));
+        s.update(Message::LyricsScrolled(400.0)); // echo of our own scroll
+        let pad = s.look.pad;
+        let centred = move |i: f32| (i + 0.5) * LYRIC_LH + pad - 200.0;
+        assert_eq!(at(&mut s, 5.0), None); // same line
+        let want = centred(10.0);
+        assert_eq!(at(&mut s, 100.0), Some(Scroll::Lyrics(want)));
+        s.update(Message::LyricsScrolled(400.0)); // echo
+        s.update(Message::LyricsScrolled(400.0)); // the user
+        s.now += Duration::from_secs(1);
+        assert_eq!(at(&mut s, 110.0), None);
+        s.now += Duration::from_secs(6);
+        let want = centred(12.0);
+        assert_eq!(at(&mut s, 120.0), Some(Scroll::Lyrics(want)));
     }
 
     #[test]
