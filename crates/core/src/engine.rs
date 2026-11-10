@@ -1,1 +1,628 @@
+//! The engine: one thread with a tokio runtime that owns the reducer state, feeds it every event
+//! (commands, mpv events, resolver and radio results), runs the effects and emits `Update`s.
+//!
+//! Update order a front end sees: one `Update::Player` right after start (the restored session,
+//! paused/idle), then a `Player` snapshot only when it changed (about once per second while
+//! playing, nothing while paused or idle), interleaved with `Page`, `Lyrics`, `Notice` and
+//! `AuthRequired` as background work finishes. The receiver closes once the engine has stopped
+//! mpv and saved, after `Command::Quit` or after every `Handle` was dropped.
 
+use crate::api::{Api, ApiError};
+use crate::media::Media;
+use crate::player::mpv::{MpvEvent, MpvPlayer};
+use crate::player::state::{reduce, Effect, Event, State, Stream};
+use crate::types::{Command, Lyrics, Rating, Snapshot, Status, Track, Update};
+use crate::{auth, lyrics, persist, resolve};
+use futures::future::{BoxFuture, FutureExt};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::RwLock;
+use tokio::time::Instant;
+
+/// The only way into the engine. Cheap to clone.
+#[derive(Clone)]
+pub struct Handle {
+    tx: UnboundedSender<Command>,
+}
+
+impl Handle {
+    /// Never blocks. Silently dropped once the engine has stopped.
+    pub fn send(&self, cmd: Command) {
+        let _ = self.tx.send(cmd);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// Windows window handle for the OS media controls; ignored elsewhere.
+    pub hwnd: Option<*mut std::ffi::c_void>,
+}
+
+/// Starts the engine thread. Fails only when the runtime or mpv cannot be created.
+pub fn start(opts: Options) -> Result<(Handle, UnboundedReceiver<Update>), String> {
+    // Raw pointers are not Send; the handle is only passed through to souvlaki.
+    let hwnd = opts.hwnd.map(|p| p as usize);
+    spawn(persist::state_path(), move |tx| {
+        let events = tx.clone();
+        let mpv = MpvPlayer::new(move |e| {
+            let _ = events.send(Msg::Ev(from_mpv(e)));
+        })?;
+        let api: ApiCell = Arc::new(RwLock::new(None));
+        // Taken before anyone can read, so API users wait for the first connection instead of
+        // seeing `None`, while startup and playback do not.
+        if let Ok(mut slot) = api.clone().try_write_owned() {
+            tokio::spawn(async move { *slot = Some(Api::new().await) });
+        }
+        let media = Media::new(hwnd.map(|h| h as *mut std::ffi::c_void), move |c| {
+            let _ = tx.send(Msg::Cmd(c));
+        });
+        let backend = Real {
+            mpv,
+            api: api.clone(),
+        };
+        Ok((Box::new(backend) as Box<dyn Backend>, media, api))
+    })
+}
+
+/// `None` only until the first connection finishes (or forever in tests).
+type ApiCell = Arc<RwLock<Option<Api>>>;
+type Tx = UnboundedSender<Msg>;
+
+/// Internal messages: everything that wakes the loop besides front-end commands.
+enum Msg {
+    /// From the OS media controls.
+    Cmd(Command),
+    Ev(Event),
+    /// Background results to forward (lyrics are checked against the current track first).
+    Up(Update),
+}
+
+/// The test seam: everything with side effects outside this thread.
+trait Backend {
+    /// Player effects (everything except `Resolve`, `FetchRadio` and `Persist`).
+    fn play(&self, fx: &Effect);
+    fn resolve(&self, video_id: String) -> BoxFuture<'static, Result<Stream, String>>;
+    fn radio(&self, video_id: String) -> BoxFuture<'static, Result<Vec<Track>, String>>;
+    fn lyrics(&self, track: Track) -> BoxFuture<'static, Option<Lyrics>>;
+}
+
+struct Real {
+    mpv: MpvPlayer,
+    api: ApiCell,
+}
+
+impl Backend for Real {
+    fn play(&self, fx: &Effect) {
+        let m = &self.mpv;
+        match fx {
+            Effect::Load(s) => m.load(s),
+            Effect::AppendNext(s) => m.append_next(s),
+            Effect::ClearNext => m.clear_next(),
+            Effect::SetPause(p) => m.set_pause(*p),
+            Effect::Seek(secs) => m.seek(*secs),
+            Effect::SetVolume(v) => m.set_volume(*v),
+            Effect::SetNormalize(on) => m.set_normalize(*on),
+            Effect::Stop => m.stop(),
+            Effect::Resolve(_) | Effect::FetchRadio(_) | Effect::Persist => {}
+        }
+    }
+
+    fn resolve(&self, video_id: String) -> BoxFuture<'static, Result<Stream, String>> {
+        async move {
+            let cookies = auth::logged_in().then(auth::cookie_path);
+            resolve::resolve(&video_id, cookies.as_deref()).await
+        }
+        .boxed()
+    }
+
+    fn radio(&self, video_id: String) -> BoxFuture<'static, Result<Vec<Track>, String>> {
+        let api = self.api.clone();
+        async move {
+            let g = api.read().await;
+            g.as_ref().ok_or_else(not_connected)?.radio(&video_id).await
+        }
+        .map(|r| r.map_err(|e| e.to_string()))
+        .boxed()
+    }
+
+    fn lyrics(&self, track: Track) -> BoxFuture<'static, Option<Lyrics>> {
+        let api = self.api.clone();
+        async move {
+            if let Some(l) = lyrics::fetch(&track).await {
+                return Some(l);
+            }
+            let g = api.read().await;
+            match g.as_ref()?.lyrics(&track.video_id).await {
+                Ok(text) => text.map(|t| lyrics::plain(&t)),
+                Err(e) => {
+                    log::debug!("lyrics for {}: {e}", track.video_id);
+                    None
+                }
+            }
+        }
+        .boxed()
+    }
+}
+
+fn not_connected() -> ApiError {
+    ApiError::Other("YouTube Music is not connected".into())
+}
+
+fn from_mpv(e: MpvEvent) -> Event {
+    match e {
+        MpvEvent::FileLoaded => Event::FileLoaded,
+        MpvEvent::EndFile(r) => Event::EndFile(r),
+        MpvEvent::PauseChanged(p) => Event::PauseChanged(p),
+        MpvEvent::TimePos(t) => Event::TimePos(t),
+        MpvEvent::Duration(d) => Event::Duration(d),
+        MpvEvent::Buffering(b) => Event::Buffering(b),
+    }
+}
+
+/// Runs `setup` on the new engine thread (inside its runtime) and the loop after it.
+fn spawn(
+    state_path: PathBuf,
+    setup: impl FnOnce(Tx) -> Result<(Box<dyn Backend>, Option<Media>, ApiCell), String>
+        + Send
+        + 'static,
+) -> Result<(Handle, UnboundedReceiver<Update>), String> {
+    let (cmd_tx, cmds) = unbounded_channel();
+    let (up, up_rx) = unbounded_channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("cmusic-engine".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => return drop(ready_tx.send(Err(format!("tokio runtime: {e}")))),
+            };
+            rt.block_on(async move {
+                let (tx, msgs) = unbounded_channel();
+                let (backend, media, api) = match setup(tx.clone()) {
+                    Ok(parts) => parts,
+                    Err(e) => return drop(ready_tx.send(Err(e))),
+                };
+                let _ = ready_tx.send(Ok(()));
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |d| d.as_nanos() as u64);
+                let engine = Engine {
+                    st: State::new(seed),
+                    backend,
+                    media,
+                    api,
+                    tx,
+                    up,
+                    path: state_path,
+                    last: None,
+                    save_at: None,
+                    last_save: Instant::now(),
+                    lyrics_for: None,
+                };
+                engine.run(cmds, msgs).await;
+            });
+            // Do not wait for a cookie import still running on the blocking pool.
+            rt.shutdown_background();
+        })
+        .map_err(|e| format!("engine thread: {e}"))?;
+    ready_rx
+        .recv()
+        .map_err(|_| "engine thread died during startup".to_string())??;
+    Ok((Handle { tx: cmd_tx }, up_rx))
+}
+
+struct Engine {
+    st: State,
+    backend: Box<dyn Backend>,
+    media: Option<Media>,
+    api: ApiCell,
+    tx: Tx,
+    up: UnboundedSender<Update>,
+    path: PathBuf,
+    /// Last snapshot sent.
+    last: Option<Snapshot>,
+    /// Pending debounced save.
+    save_at: Option<Instant>,
+    last_save: Instant,
+    /// Video id the latest lyrics request is for.
+    lyrics_for: Option<String>,
+}
+
+const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+const SAVE_WHILE_PLAYING: Duration = Duration::from_secs(15);
+
+impl Engine {
+    async fn run(mut self, mut cmds: UnboundedReceiver<Command>, mut msgs: UnboundedReceiver<Msg>) {
+        if let Some(s) = persist::load_from(&self.path) {
+            self.event(Event::Restored {
+                queue: s.queue,
+                cursor: s.cursor,
+                position_secs: s.position_secs,
+                volume: s.volume,
+                shuffle: s.shuffle,
+                repeat: s.repeat,
+                normalize: s.normalize,
+            });
+        }
+        self.emit();
+        loop {
+            let save_at = self.save_at;
+            let msg = tokio::select! {
+                // Every Handle dropped counts as Quit.
+                c = cmds.recv() => Msg::Cmd(c.unwrap_or(Command::Quit)),
+                Some(m) = msgs.recv() => m,
+                _ = tokio::time::sleep_until(save_at.unwrap_or_else(Instant::now)),
+                    if save_at.is_some() => {
+                    self.save();
+                    continue;
+                }
+            };
+            match msg {
+                Msg::Cmd(Command::Quit) => break,
+                Msg::Cmd(c) => self.command(c),
+                Msg::Ev(e) => self.event(e),
+                Msg::Up(Update::Lyrics { video_id, .. })
+                    if self.lyrics_for.as_ref() != Some(&video_id) => {}
+                Msg::Up(u) => {
+                    let _ = self.up.send(u);
+                }
+            }
+        }
+        self.backend.play(&Effect::Stop);
+        self.save();
+    }
+
+    fn command(&mut self, c: Command) {
+        match c {
+            Command::Fetch(_)
+            | Command::Rate { .. }
+            | Command::AddToPlaylist { .. }
+            | Command::RemoveFromPlaylist { .. }
+            | Command::ImportCookies(_) => {
+                let (api, tx) = (self.api.clone(), self.tx.clone());
+                tokio::spawn(async move {
+                    for u in account(&api, c).await {
+                        let _ = tx.send(Msg::Up(u));
+                    }
+                });
+            }
+            c => self.event(Event::Command(c)),
+        }
+    }
+
+    fn event(&mut self, e: Event) {
+        for fx in reduce(&mut self.st, e) {
+            self.effect(fx);
+        }
+        self.emit();
+    }
+
+    fn effect(&mut self, fx: Effect) {
+        let tx = self.tx.clone();
+        match fx {
+            Effect::Resolve(video_id) => {
+                let fut = self.backend.resolve(video_id.clone());
+                tokio::spawn(async move {
+                    let ev = match fut.await {
+                        Ok(stream) => Event::Resolved { video_id, stream },
+                        Err(message) => Event::ResolveFailed { video_id, message },
+                    };
+                    let _ = tx.send(Msg::Ev(ev));
+                });
+            }
+            Effect::FetchRadio(video_id) => {
+                let fut = self.backend.radio(video_id);
+                tokio::spawn(async move {
+                    let tracks = fut.await.unwrap_or_else(|e| {
+                        let _ = tx.send(Msg::Up(Update::Notice(format!("Autoplay: {e}"))));
+                        Vec::new()
+                    });
+                    let _ = tx.send(Msg::Ev(Event::RadioFetched(tracks)));
+                });
+            }
+            Effect::Persist => {
+                self.save_at
+                    .get_or_insert_with(|| Instant::now() + SAVE_DEBOUNCE);
+            }
+            fx => self.backend.play(&fx),
+        }
+    }
+
+    /// Sends the snapshot if it changed, and follows up on what depends on it.
+    fn emit(&mut self) {
+        let snap = self.st.snapshot();
+        if self.last.as_ref() == Some(&snap) {
+            return;
+        }
+        if let Some(m) = &mut self.media {
+            m.update(&snap);
+        }
+        let current = snap.current().cloned();
+        if current.as_ref().map(|t| &t.video_id) != self.lyrics_for.as_ref() {
+            self.lyrics_for = current.as_ref().map(|t| t.video_id.clone());
+            if let Some(track) = current {
+                let (fut, tx) = (self.backend.lyrics(track.clone()), self.tx.clone());
+                tokio::spawn(async move {
+                    let lyrics = fut.await;
+                    let video_id = track.video_id;
+                    let _ = tx.send(Msg::Up(Update::Lyrics { video_id, lyrics }));
+                });
+            }
+        }
+        if snap.status == Status::Playing
+            && self.save_at.is_none()
+            && self.last_save.elapsed() >= SAVE_WHILE_PLAYING
+        {
+            self.save_at = Some(Instant::now());
+        }
+        let _ = self.up.send(Update::Player(snap.clone()));
+        self.last = Some(snap);
+    }
+
+    /// Inline on purpose: a few KB of JSON at most every 2 s (15 s while just playing), and a
+    /// single writer means no two saves can race on the temp file.
+    fn save(&mut self) {
+        self.save_at = None;
+        self.last_save = Instant::now();
+        let saved = persist::Saved::from(&self.st.snapshot());
+        if let Err(e) = persist::save_to(&self.path, &saved) {
+            log::warn!("saving {}: {e}", self.path.display());
+        }
+    }
+}
+
+/// Runs one account/browsing command and returns the updates it produces.
+async fn account(api: &ApiCell, cmd: Command) -> Vec<Update> {
+    if let Command::ImportCookies(src) = cmd {
+        let imported = tokio::task::spawn_blocking(move || auth::import(&src))
+            .await
+            .unwrap_or_else(|e| Err(format!("cookie import failed: {e}")));
+        if let Err(e) = imported {
+            return vec![Update::AuthRequired(e)];
+        }
+        let mut g = api.write().await;
+        match g.as_mut() {
+            Some(a) => a.reload_auth().await,
+            None => *g = Some(Api::new().await),
+        }
+        return vec![if g.as_ref().is_some_and(Api::is_logged_in) {
+            Update::Notice("Logged in".into())
+        } else {
+            Update::AuthRequired("Cookies saved, but YouTube Music did not accept them".into())
+        }];
+    }
+    let g = api.read().await;
+    let api = g.as_ref().ok_or_else(not_connected);
+    let (result, ok) = match cmd {
+        Command::Fetch(request) => {
+            let result = async { api?.fetch(&request).await }.await;
+            let mut out = Vec::new();
+            if let Err(ApiError::Auth(m)) = &result {
+                out.push(Update::AuthRequired(m.clone()));
+            }
+            let result = result.map_err(|e| e.to_string());
+            out.insert(0, Update::Page { request, result });
+            return out;
+        }
+        Command::Rate { video_id, rating } => (
+            async { api?.rate(&video_id, rating).await }.await,
+            match rating {
+                Rating::Like => "Liked",
+                Rating::Dislike => "Disliked",
+                Rating::None => "Rating removed",
+            },
+        ),
+        Command::AddToPlaylist {
+            playlist_id,
+            video_id,
+        } => (
+            async { api?.add_to_playlist(&playlist_id, &video_id).await }.await,
+            "Added to playlist",
+        ),
+        Command::RemoveFromPlaylist {
+            playlist_id,
+            video_id,
+        } => (
+            async { api?.remove_from_playlist(&playlist_id, &video_id).await }.await,
+            "Removed from playlist",
+        ),
+        _ => return Vec::new(),
+    };
+    vec![match result {
+        Ok(()) => Update::Notice(ok.into()),
+        Err(ApiError::Auth(m)) => Update::AuthRequired(m),
+        Err(ApiError::Other(m)) => Update::Notice(m),
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::player::state::EndReason;
+    use std::sync::Mutex;
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// Resolves instantly to `Stream { url: id }` except for `fail`; records player calls.
+    struct Fake {
+        log: Log,
+        fail: &'static str,
+    }
+
+    impl Backend for Fake {
+        fn play(&self, fx: &Effect) {
+            let line = match fx {
+                Effect::Load(s) => format!("load {}", s.url),
+                Effect::AppendNext(s) => format!("append {}", s.url),
+                fx => format!("{fx:?}"),
+            };
+            self.log.lock().unwrap().push(line);
+        }
+        fn resolve(&self, id: String) -> BoxFuture<'static, Result<Stream, String>> {
+            let fail = id == self.fail;
+            async move {
+                if fail {
+                    Err(format!("{id} unavailable"))
+                } else {
+                    Ok(Stream {
+                        url: id,
+                        headers: Vec::new(),
+                    })
+                }
+            }
+            .boxed()
+        }
+        fn radio(&self, _: String) -> BoxFuture<'static, Result<Vec<Track>, String>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+        fn lyrics(&self, _: Track) -> BoxFuture<'static, Option<Lyrics>> {
+            async { None }.boxed()
+        }
+    }
+
+    struct Rig {
+        handle: Handle,
+        rx: UnboundedReceiver<Update>,
+        inject: Tx,
+        log: Log,
+        dir: PathBuf,
+    }
+
+    fn rig(name: &str, fail: &'static str) -> Rig {
+        let dir = std::env::temp_dir().join(format!("cmusic-engine-{}-{name}", std::process::id()));
+        let log = Log::default();
+        let (inject_tx, inject_rx) = std::sync::mpsc::channel();
+        let fake = Fake {
+            log: log.clone(),
+            fail,
+        };
+        let (handle, rx) = spawn(dir.join("state.json"), move |tx| {
+            inject_tx.send(tx).unwrap();
+            Ok((
+                Box::new(fake) as Box<dyn Backend>,
+                None,
+                Arc::new(RwLock::new(None)),
+            ))
+        })
+        .unwrap();
+        let inject = inject_rx.recv().unwrap();
+        Rig {
+            handle,
+            rx,
+            inject,
+            log,
+            dir,
+        }
+    }
+
+    impl Rig {
+        fn ev(&self, e: Event) {
+            self.inject.send(Msg::Ev(e)).unwrap();
+        }
+
+        async fn wait_for(&self, line: &str) {
+            for _ in 0..200 {
+                if self.log.lock().unwrap().iter().any(|l| l == line) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("no {line:?} in {:?}", self.log.lock().unwrap());
+        }
+
+        /// Quits after the injected events (same channel, so in order) and returns every
+        /// player snapshot sent.
+        async fn finish(mut self) -> Vec<Snapshot> {
+            let _ = self.inject.send(Msg::Cmd(Command::Quit));
+            let mut snaps = Vec::new();
+            while let Some(u) = tokio::time::timeout(Duration::from_secs(5), self.rx.recv())
+                .await
+                .expect("receiver closes after Quit")
+            {
+                if let Update::Player(s) = u {
+                    snaps.push(s);
+                }
+            }
+            std::fs::remove_dir_all(&self.dir).ok();
+            snaps
+        }
+    }
+
+    fn play(ids: &[&str]) -> Command {
+        let tracks = ids
+            .iter()
+            .map(|id| Track {
+                video_id: id.to_string(),
+                title: id.to_string(),
+                artists: String::new(),
+                album: None,
+                duration_secs: Some(100),
+                thumbnail_url: None,
+            })
+            .collect();
+        Command::PlayTracks { tracks, start: 0 }
+    }
+
+    #[tokio::test]
+    async fn plays_three_tracks_gaplessly() {
+        let r = rig("three", "");
+        r.handle.send(play(&["a", "b", "c"]));
+        r.wait_for("load a").await;
+        r.ev(Event::FileLoaded);
+        r.wait_for("append b").await;
+        r.ev(Event::EndFile(EndReason::Eof));
+        r.ev(Event::FileLoaded);
+        r.wait_for("append c").await;
+        r.ev(Event::EndFile(EndReason::Eof));
+        r.ev(Event::FileLoaded);
+        let log = r.log.clone();
+        let snaps = r.finish().await;
+        let playing: Vec<_> = snaps
+            .iter()
+            .filter(|s| s.status == Status::Playing)
+            .map(|s| s.cursor)
+            .collect();
+        assert_eq!(playing, [Some(0), Some(1), Some(2)]);
+        let log = log.lock().unwrap();
+        let loads: Vec<_> = log.iter().filter(|l| l.starts_with("load")).collect();
+        assert_eq!(loads, ["load a"]);
+    }
+
+    #[tokio::test]
+    async fn failed_resolve_skips_the_track() {
+        let r = rig("fail", "b");
+        r.handle.send(play(&["a", "b", "c"]));
+        r.wait_for("load a").await;
+        r.ev(Event::FileLoaded);
+        r.ev(Event::EndFile(EndReason::Eof));
+        r.wait_for("load c").await;
+        let log = r.log.clone();
+        let snaps = r.finish().await;
+        assert!(snaps
+            .iter()
+            .any(|s| s.cursor == Some(2) && s.last_error.as_deref() == Some("b unavailable")));
+        assert!(!log.lock().unwrap().iter().any(|l| l.ends_with(" b")));
+    }
+
+    #[tokio::test]
+    async fn quit_or_dropping_handles_closes_updates() {
+        let r = rig("quit", "");
+        r.handle.send(Command::Quit);
+        let snaps = r.finish().await;
+        assert_eq!(snaps.len(), 1, "only the initial snapshot");
+        let mut r = rig("drop", "");
+        drop(r.handle);
+        let closed = async { while r.rx.recv().await.is_some() {} };
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("receiver closes when every Handle is gone");
+        // The final save happened too.
+        assert!(persist::load_from(&r.dir.join("state.json")).is_some());
+        std::fs::remove_dir_all(&r.dir).ok();
+    }
+}

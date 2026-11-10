@@ -36,7 +36,12 @@ fn dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("", "", "cmusic")
 }
 
+/// `CMUSIC_STATE_DIR`, when set, overrides the directory, so the `play` example (or any manual run)
+/// never reads or overwrites the user's saved session.
 pub fn state_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CMUSIC_STATE_DIR") {
+        return PathBuf::from(dir).join("state.json");
+    }
     match dirs() {
         Some(d) => d
             .state_dir()
@@ -65,7 +70,7 @@ pub fn save(s: &Saved) -> std::io::Result<()> {
     save_to(&state_path(), s)
 }
 
-fn load_from(path: &Path) -> Option<Saved> {
+pub(crate) fn load_from(path: &Path) -> Option<Saved> {
     let bytes = std::fs::read(path).ok()?;
     match serde_json::from_slice(&bytes) {
         Ok(s) => Some(s),
@@ -76,7 +81,7 @@ fn load_from(path: &Path) -> Option<Saved> {
     }
 }
 
-fn save_to(path: &Path, s: &Saved) -> std::io::Result<()> {
+pub(crate) fn save_to(path: &Path, s: &Saved) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
