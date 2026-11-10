@@ -13,10 +13,17 @@ use std::collections::{HashMap, HashSet};
 fn blurred(bytes: &[u8]) -> Option<image::Handle> {
     const N: u32 = 64;
     let img = ::image::load_from_memory(bytes).ok()?;
-    let px = img
+    let mut px = img
         .resize_to_fill(N, N, ::image::imageops::FilterType::Triangle)
         .blur(6.0)
         .to_rgba8();
+    // Covers are often dull once blurred: push saturation so the glass has colour to refract.
+    for p in px.pixels_mut() {
+        let [r, g, b, _] = p.0.map(f32::from);
+        let grey = 0.3 * r + 0.59 * g + 0.11 * b;
+        let lift = |c: f32| ((grey + (c - grey) * 1.9) * 1.15).clamp(0.0, 255.0) as u8;
+        p.0 = [lift(r), lift(g), lift(b), 255];
+    }
     Some(image::Handle::from_rgba(N, N, px.into_raw()))
 }
 

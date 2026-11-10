@@ -132,6 +132,7 @@ fn main_area(s: &State) -> Element<'_, Message> {
     column![
         header,
         scrollable(rows.padding([0.0, PAD]))
+            .style(scroll)
             .height(Fill)
             .width(Fill),
         text(note.unwrap_or_default()).size(13)
@@ -202,7 +203,11 @@ fn lyrics_view(s: &State) -> Element<'_, Message> {
                 });
             }
             // ponytail: no auto-scroll to the current line; add scrollable::scroll_to if wanted.
-            scrollable(c.padding(PAD)).height(Fill).width(Fill).into()
+            scrollable(c.padding(PAD))
+                .style(scroll)
+                .height(Fill)
+                .width(Fill)
+                .into()
         }
         _ => text("No lyrics").into(),
     };
@@ -271,7 +276,7 @@ fn queue(s: &State) -> Element<'_, Message> {
                 .style(pill(false)),
         ]
         .align_y(Center),
-        scrollable(c).height(Fill).width(Fill),
+        scrollable(c).style(scroll).height(Fill).width(Fill),
     ]
     .spacing(PAD)
     .width(280)
@@ -296,8 +301,8 @@ fn bar(s: &State) -> Element<'_, Message> {
         })
         .size(13)
         .style(text::secondary),
-    ]
-    .width(220);
+    ];
+    let info = container(info).width(220).clip(true);
     let playing = matches!(snap.status, Status::Playing | Status::Buffering);
     let max = snap.duration_secs.max(1.0);
     let pos = s.drag.unwrap_or(snap.position_secs).min(max);
@@ -419,8 +424,8 @@ fn scrim(_: &Theme) -> container::Style {
     container::Style {
         background: Some(
             gradient::Linear::new(std::f32::consts::PI)
-                .add_stop(0.0, Color::from_rgba(0.02, 0.03, 0.08, 0.35))
-                .add_stop(1.0, Color::from_rgba(0.02, 0.03, 0.08, 0.62))
+                .add_stop(0.0, Color::from_rgba(0.02, 0.03, 0.08, 0.22))
+                .add_stop(1.0, Color::from_rgba(0.02, 0.03, 0.08, 0.50))
                 .into(),
         ),
         ..Default::default()
@@ -545,4 +550,19 @@ fn rail(_: &Theme, status: slider::Status) -> slider::Style {
             border_color: Color::TRANSPARENT,
         },
     }
+}
+
+fn scroll(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let mut st = scrollable::default(theme, status);
+    let rail = scrollable::Rail {
+        background: None,
+        border: border::rounded(4),
+        scroller: scrollable::Scroller {
+            background: white(0.22).into(),
+            border: border::rounded(4),
+        },
+    };
+    st.vertical_rail = rail;
+    st.horizontal_rail = rail;
+    st
 }
