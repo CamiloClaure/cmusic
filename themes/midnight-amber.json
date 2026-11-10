@@ -1,0 +1,21 @@
+{
+  "accent_a": "#ffb347",
+  "accent_b": "#ff8a3d",
+  "ink": "#0b0906",
+  "text": "#fff4e0f0",
+  "text_dim": "#f0dcbcc0",
+  "panel_top": "#fff1d61c",
+  "panel_mid": "#fff1d616",
+  "panel_bottom": "#fff1d60e",
+  "panel_border": "#ffd9a040",
+  "control": "#ffe2b01e",
+  "control_border": "#ffe2b038",
+  "scrim_top": "#0b0906b0",
+  "scrim_bottom": "#0b0906d0",
+  "base": ["#0b0906", "#1b110a", "#120b06"],
+  "radius_panel": 16,
+  "radius_row": 10,
+  "backdrop": true,
+  "backdrop_blur": 10,
+  "backdrop_saturation": 1.3
+}

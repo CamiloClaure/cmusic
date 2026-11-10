@@ -33,6 +33,7 @@ fn main() -> iced::Result {
             std::process::exit(1);
         }
     }
+    theme::install_presets();
     let (size, saved) = load_prefs();
     let (look, theme_name, notice) = match theme::load(&saved) {
         Ok(l) => (l, saved, None),
@@ -106,8 +107,22 @@ fn subscription(_: &State) -> Subscription<Message> {
     ])
 }
 
-fn update(app: &mut State, msg: Message) -> Task<Message> {
+fn update(app: &mut State, mut msg: Message) -> Task<Message> {
+    if let Message::Engine(Update::Page { result: Ok(p), .. }) = &mut msg {
+        if std::env::var_os("CMUSIC_DEMO_ENTRIES").is_some() {
+            p.items
+                .retain(|i| !matches!(i, cmusic_core::Item::Track(_)));
+        }
+    }
     let follow = demo_followups(&msg);
+    if let Message::Engine(Update::Page { result, .. }) = &msg {
+        if std::env::var_os("CMUSIC_DEMO_PAGE").is_some() {
+            match result {
+                Ok(p) => eprintln!("page: {} items", p.items.len()),
+                Err(e) => eprintln!("page error: {e}"),
+            }
+        }
+    }
     app.now = std::time::Instant::now();
     let Out {
         commands,
@@ -230,6 +245,8 @@ fn save_prefs(s: Size, theme: &str) {
 
 // Debug harness for screenshots, inert unless these env vars are set:
 //   CMUSIC_DEMO=<query>        search it at startup, then play row 0 when the page arrives
+//   CMUSIC_DEMO_PAGE=liked|playlists|songs|albums|artists  open that sidebar page (no playback)
+//   CMUSIC_DEMO_ENTRIES=1|artist  drop the tracks (or show albums as artists) from the arriving page
 //   CMUSIC_SHOT=<path.png>     after CMUSIC_SHOT_AFTER secs (default 20) save the window, then exit
 //   CMUSIC_DEMO_VIEW=lyrics|login  switch the main area to that view when row 0 starts playing
 fn demo_start() -> Task<Message> {
@@ -237,8 +254,19 @@ fn demo_start() -> Task<Message> {
     if let Ok(q) = std::env::var("CMUSIC_DEMO") {
         t = Task::done(Message::SearchInput(q)).chain(Task::done(Message::SearchSubmit));
     }
+    if let Ok(p) = std::env::var("CMUSIC_DEMO_PAGE") {
+        use cmusic_core::PageRequest as P;
+        let r = match p.as_str() {
+            "liked" => P::LikedSongs,
+            "playlists" => P::LibraryPlaylists,
+            "songs" => P::LibrarySongs,
+            "albums" => P::LibraryAlbums,
+            _ => P::LibraryArtists,
+        };
+        t = Task::done(Message::Open(r));
+    }
     if let Ok(path) = std::env::var("CMUSIC_SHOT") {
-        let secs = std::env::var("CMUSIC_SHOT_AFTER")
+        let secs: u64 = std::env::var("CMUSIC_SHOT_AFTER")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20);

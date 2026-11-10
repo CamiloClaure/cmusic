@@ -78,8 +78,8 @@ impl Default for Look {
             panel_border: c("#ffffff38"),
             control: c("#ffffff1a"),
             control_border: c("#ffffff33"),
-            scrim_top: c("#05081438"),
-            scrim_bottom: c("#05081480"),
+            scrim_top: c("#05081480"),
+            scrim_bottom: c("#050814a0"),
             base: [c("#121a3d"), c("#29174d"), c("#083342")],
             radius_panel: 20.0,
             radius_row: 12.0,
@@ -174,6 +174,34 @@ pub fn themes_dir() -> PathBuf {
         .map_or_else(|| PathBuf::from("themes"), |p| p.join("themes"))
 }
 
+/// The bundled presets, written to the themes dir on first run.
+const PRESETS: [(&str, &str); 4] = [
+    (
+        "flat-dark.json",
+        include_str!("../../../themes/flat-dark.json"),
+    ),
+    ("glass.json", include_str!("../../../themes/glass.json")),
+    ("light.json", include_str!("../../../themes/light.json")),
+    (
+        "midnight-amber.json",
+        include_str!("../../../themes/midnight-amber.json"),
+    ),
+];
+
+/// Creates the themes dir with the presets in it, only if the dir does not exist yet.
+pub fn install_presets() {
+    install_into(&themes_dir());
+}
+
+fn install_into(dir: &std::path::Path) {
+    if dir.exists() || std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    for (name, json) in PRESETS {
+        let _ = std::fs::write(dir.join(name), json);
+    }
+}
+
 /// Sorted file stems of `*.json` in the themes dir.
 pub fn list() -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(themes_dir())
@@ -249,7 +277,27 @@ mod tests {
             parse(&text).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
             n += 1;
         }
-        assert!(n >= 3);
+        assert_eq!(n, PRESETS.len(), "every file in themes/ must be in PRESETS");
+        for (name, json) in PRESETS {
+            assert!(std::fs::read_to_string(format!("{dir}/{name}")).unwrap() == json);
+        }
+    }
+
+    #[test]
+    fn first_run_installs_once_and_never_overwrites() {
+        let d = std::env::temp_dir().join(format!("cmusic-themes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        install_into(&d);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), PRESETS.len());
+        std::fs::write(d.join("glass.json"), "mine").unwrap();
+        std::fs::remove_file(d.join("light.json")).unwrap();
+        install_into(&d);
+        assert_eq!(
+            std::fs::read_to_string(d.join("glass.json")).unwrap(),
+            "mine"
+        );
+        assert!(!d.join("light.json").exists());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

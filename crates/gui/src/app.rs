@@ -162,6 +162,8 @@ pub struct State {
     pub search: String,
     /// Request in flight, if any.
     pub awaiting: Option<PageRequest>,
+    /// The last request that failed and its error; shown in place of the page until the next fetch.
+    pub failed: Option<(PageRequest, String)>,
     pub current: Option<(PageRequest, Page)>,
     pub history: Vec<(PageRequest, Page)>,
     pub lyrics: Option<(String, Option<Lyrics>)>,
@@ -202,6 +204,7 @@ impl State {
             snapshot: Snapshot::default(),
             search: String::new(),
             awaiting: None,
+            failed: None,
             current: None,
             history: Vec::new(),
             lyrics: None,
@@ -412,6 +415,7 @@ impl State {
         if let Some(prev) = self.history.pop() {
             self.current = Some(prev);
             self.awaiting = None;
+            self.failed = None;
             self.show_lyrics = false;
             // The list widget keeps its scroll offset across pages.
             out.scroll = Some(Scroll::ListTop);
@@ -459,6 +463,7 @@ impl State {
 
     fn fetch(&mut self, r: PageRequest, out: &mut Out) {
         self.awaiting = Some(r.clone());
+        self.failed = None;
         out.commands.push(Command::Fetch(r));
     }
 
@@ -498,7 +503,10 @@ impl State {
                         }
                         self.show_lyrics = false;
                     }
-                    Err(e) => self.set_notice(e),
+                    Err(e) => {
+                        self.failed = Some((request, e.clone()));
+                        self.set_notice(e);
+                    }
                 }
             }
             Update::Lyrics { video_id, lyrics } => {
@@ -661,6 +669,20 @@ mod tests {
             }]
         );
         assert!(s.update(Message::PlayRow(0)).commands.is_empty());
+    }
+
+    #[test]
+    fn failed_page_keeps_its_error_until_the_next_fetch() {
+        let mut s = state();
+        s.update(Message::Open(PageRequest::LikedSongs));
+        s.update(Message::Engine(Update::Page {
+            request: PageRequest::LikedSongs,
+            result: Err("boom".into()),
+        }));
+        assert_eq!(s.failed.as_ref().unwrap().1, "boom");
+        assert!(s.current.is_none() && s.awaiting.is_none());
+        s.update(Message::Open(PageRequest::LibrarySongs));
+        assert!(s.failed.is_none());
     }
 
     #[test]

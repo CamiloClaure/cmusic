@@ -5,7 +5,7 @@ use cmusic_core::{lyrics, Item, PageRequest, Repeat, Status, Track};
 use iced::widget::svg::{self, Svg};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, hover, image, row, scrollable, slider, space, stack, text,
+    button, column, container, hover, image, opaque, row, scrollable, slider, space, stack, text,
     text_input, tooltip,
 };
 use iced::{
@@ -143,6 +143,7 @@ fn fit(l: Look, t: &str, width: f32, base: f32) -> String {
     format!("{}...", head.trim_end())
 }
 
+// ponytail: border_radius is ignored by the software renderer (it applies on GPU only).
 fn art<'a>(s: &'a State, url: Option<&String>, size: u32) -> Element<'a, Message> {
     let l = s.look;
     match url.and_then(|u| s.art.get(u)) {
@@ -177,6 +178,7 @@ fn art_mark<'a>(
     }
     stack![
         a,
+        // ponytail: the one fixed-colour spot (white glyph on a black square), by design.
         container(ico(icons::equalizer(), size as f32 * 0.5, Color::WHITE))
             .center(size)
             .style(move |_| container::Style {
@@ -196,6 +198,29 @@ fn ico(icon: Svg<'static>, size: f32, color: Color) -> Svg<'static> {
         .style(move |_, _| svg::Style { color: Some(color) })
 }
 
+/// `content` with a themed tooltip.
+fn tipped<'a>(
+    l: Look,
+    content: impl Into<Element<'a, Message>>,
+    tip: impl Into<String>,
+) -> Element<'a, Message> {
+    tooltip(
+        content,
+        container(text(tip.into()).size(sz(l, S)))
+            .padding([3, 8])
+            .style(move |_| container::Style {
+                background: Some(tint(l.ink, 0.92).into()),
+                text_color: Some(l.text),
+                border: border::rounded(6).color(l.panel_border).width(1),
+                ..Default::default()
+            }),
+        tooltip::Position::Top,
+    )
+    .gap(4)
+    .delay(Duration::from_millis(400))
+    .into()
+}
+
 /// Square icon-only button with a tooltip naming the action; `m` None draws it disabled.
 fn ibtn<'a>(
     l: Look,
@@ -213,26 +238,17 @@ fn ibtn<'a>(
         .height(size)
         .padding(0)
         .style(style);
-    tooltip(
-        b,
-        container(text(tip.into()).size(sz(l, S)))
-            .padding([3, 8])
-            .style(move |_| container::Style {
-                background: Some(tint(l.ink, 0.92).into()),
-                text_color: Some(l.text),
-                border: border::rounded(6).color(l.panel_border).width(1),
-                ..Default::default()
-            }),
-        tooltip::Position::Top,
-    )
-    .gap(4)
-    .delay(Duration::from_millis(400))
-    .into()
+    tipped(l, b, tip)
 }
 
 fn sidebar(s: &State) -> Element<'_, Message> {
     let l = s.look;
-    let open = s.current.as_ref().map(|(r, _)| r);
+    // The section being loaded counts as open, so the click answers at once.
+    let open = s
+        .awaiting
+        .as_ref()
+        .or(s.failed.as_ref().map(|(r, _)| r))
+        .or(s.current.as_ref().map(|(r, _)| r));
     let nav = |label: &'static str, r: PageRequest| {
         let on = open == Some(&r);
         button(txt(l, label))
@@ -283,7 +299,7 @@ fn sidebar(s: &State) -> Element<'_, Message> {
     .into()
 }
 
-/// Section title row: `lead` (a back button, or nothing) then the title.
+/// Section title row: the title, then `trail` (a button, or nothing).
 fn head<'a>(l: Look, title: String, trail: Option<Element<'a, Message>>) -> Element<'a, Message> {
     let mut r = row![text(title)
         .size(sz(l, T))
@@ -299,7 +315,11 @@ fn head<'a>(l: Look, title: String, trail: Option<Element<'a, Message>>) -> Elem
 }
 
 /// Centred message for loading, empty and first-start states.
-fn hint<'a>(l: Look, title: Option<String>, msg: &'static str) -> Element<'a, Message> {
+fn hint<'a>(
+    l: Look,
+    title: Option<String>,
+    msg: impl text::IntoFragment<'a>,
+) -> Element<'a, Message> {
     let mut c = column![].spacing(6).align_x(Center);
     if let Some(t) = title {
         c = c.push(text(t).size(sz(l, T)).center());
@@ -330,7 +350,7 @@ fn main_area(s: &State) -> Element<'_, Message> {
         return lyrics_view(s);
     }
     let title = match (&s.awaiting, &s.current) {
-        (None, Some((_, p))) => p.title.clone(),
+        (None, Some((_, p))) if s.failed.is_none() => p.title.clone(),
         _ => String::new(),
     };
     let back = (!s.history.is_empty()).then(|| {
@@ -349,6 +369,10 @@ fn main_area(s: &State) -> Element<'_, Message> {
     let avail = (main_w(s) - RAIL - 6.0 * l.pad - 40.0 - DUR).max(80.0);
     let body: Element<_> = match (&s.awaiting, &s.current) {
         (Some(r), _) => hint(l, Some(request_name(r)), "Loading..."),
+        (None, _) if s.failed.is_some() => {
+            let (r, e) = s.failed.as_ref().expect("checked by the guard");
+            hint(l, Some(request_name(r)), e.as_str())
+        }
         (None, Some((_, p))) if !p.items.is_empty() => {
             let mut rows = column![].spacing(4);
             for (i, it) in p.items.iter().enumerate().take(MAX_ROWS) {
@@ -408,10 +432,10 @@ fn list_row<'a>(
     match actions {
         None => b.into(),
         // The actions sit in an opaque-ish pill at the right end, over the duration and the end
-        // of the title, so nothing shows through. The buttons capture their own clicks.
+        // of the title, so nothing shows through. `opaque` makes the padding and border swallow clicks too.
         Some(a) => hover(
             b,
-            container(container(a).padding(2).style(move |_| {
+            container(opaque(container(a).padding(2).style(move |_| {
                 container::Style {
                     background: Some(tint(l.ink, 0.88).into()),
                     border: border::rounded(l.radius_row)
@@ -419,7 +443,7 @@ fn list_row<'a>(
                         .width(1),
                     ..Default::default()
                 }
-            }))
+            })))
             .width(Fill)
             .height(Fill)
             .align_x(Right)
@@ -454,10 +478,11 @@ fn item_row<'a>(s: &'a State, i: usize, it: &'a Item, w: f32) -> Element<'a, Mes
     };
     let playing = matches!(it, Item::Track(t) if Some(&t.video_id) == s.snapshot.current().map(|c| &c.video_id));
     // Non-track rows have no duration column.
+    // They get a chevron instead (16 px plus its spacing).
     let w = if matches!(it, Item::Track(_)) {
         w
     } else {
-        w + DUR
+        w + DUR - 16.0 - l.pad
     };
     let mut name = line(l, fit(l, title, w, B));
     if playing {
@@ -476,6 +501,8 @@ fn item_row<'a>(s: &'a State, i: usize, it: &'a Item, w: f32) -> Element<'a, Mes
     .align_y(Center);
     let press = open.map_or(Message::PlayRow(i), Message::Open);
     let Item::Track(t) = it else {
+        let chevron: Element<'a, Message> = ico(icons::chevron_right(), 16.0, l.text_dim).into();
+        body = body.push(chevron);
         return list_row(l, body, press, None);
     };
     body = body.push(
@@ -685,7 +712,7 @@ fn queue(s: &State, qw: f32) -> Element<'_, Message> {
 }
 
 /// Now-playing bar: art and text on the left, transport over the seek bar in the middle,
-/// volume and toggles on the right.
+/// volume and toggles on the right. Narrow windows put the seek bar (and the volume) on a second row.
 fn bar(s: &State) -> Element<'_, Message> {
     let l = s.look;
     let snap = &s.snapshot;
@@ -696,7 +723,7 @@ fn bar(s: &State) -> Element<'_, Message> {
         Status::Error => "Error",
         _ => "",
     };
-    let w = if narrow(s) { 150.0 } else { 220.0 };
+    let w = 220.0;
     // Fixed three lines so a notice never moves anything.
     let info = column![
         line(
@@ -806,23 +833,14 @@ fn bar(s: &State) -> Element<'_, Message> {
             snap.repeat != Repeat::Off,
             Message::Repeat
         ),
-        tooltip(
+        tipped(
+            l,
             button(text("Normalize").size(sz(l, S)))
                 .on_press(Message::Normalize)
                 .padding([6, 10])
                 .style(pill(l, snap.normalize)),
-            container(text("Even out loudness between tracks").size(sz(l, S)))
-                .padding([3, 8])
-                .style(move |_| container::Style {
-                    background: Some(tint(l.ink, 0.92).into()),
-                    text_color: Some(l.text),
-                    border: border::rounded(6).color(l.panel_border).width(1),
-                    ..Default::default()
-                }),
-            tooltip::Position::Top
-        )
-        .gap(4)
-        .delay(Duration::from_millis(400)),
+            "Even out loudness between tracks"
+        ),
         tog(
             icons::music(),
             "Lyrics",
@@ -842,7 +860,7 @@ fn bar(s: &State) -> Element<'_, Message> {
         toggles = toggles.push(tog(
             icons::list(),
             "Queue",
-            s.queue_open,
+            s.queue_open && s.login.is_none(),
             Message::ToggleQueue,
         ));
     }
@@ -863,6 +881,18 @@ fn bar(s: &State) -> Element<'_, Message> {
     .on_press(Message::ToggleLyrics)
     .padding(0)
     .style(row_button(l, false));
+    let gap = l.pad + 4.0;
+    if narrow(s) {
+        // No room for a slider between the columns: the seek bar gets its own full-width row.
+        return column![
+            row![now, container(transport).center_x(Fill), toggles]
+                .spacing(gap)
+                .align_y(Center),
+            row![seek.width(Fill), volume].spacing(gap).align_y(Center),
+        ]
+        .spacing(l.pad)
+        .into();
+    }
     row![
         now,
         column![transport, seek]
@@ -872,9 +902,9 @@ fn bar(s: &State) -> Element<'_, Message> {
         column![toggles, volume]
             .spacing(l.pad)
             .align_x(Right)
-            .width(if narrow(s) { 290 } else { 250 }),
+            .width(250),
     ]
-    .spacing(l.pad + 4.0)
+    .spacing(gap)
     .align_y(Center)
     .into()
 }
@@ -988,7 +1018,7 @@ fn pill(l: Look, on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
             },
             border: border::rounded(999)
                 .color(if on {
-                    tint(Color::WHITE, 0.5 + lift)
+                    tint(l.text, 0.5 + lift)
                 } else {
                     tint(l.control_border, l.control_border.a + lift)
                 })
@@ -1045,7 +1075,7 @@ fn field(l: Look) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
                 })
                 .width(1),
             icon: tint(l.text, 0.6),
-            placeholder: tint(l.text, 0.45),
+            placeholder: tint(l.text, 0.65),
             value: tint(l.text, 0.95),
             selection: tint(l.accent_a, 0.4),
         }
@@ -1055,7 +1085,7 @@ fn field(l: Look) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
 fn rail(l: Look) -> impl Fn(&Theme, slider::Status) -> slider::Style {
     move |_, status| slider::Style {
         rail: slider::Rail {
-            backgrounds: (accent(l), tint(l.control, 0.16).into()),
+            backgrounds: (accent(l), tint(l.control, 0.24).into()),
             width: 4.0,
             border: border::rounded(2),
         },
@@ -1067,7 +1097,7 @@ fn rail(l: Look) -> impl Fn(&Theme, slider::Status) -> slider::Style {
                     8.0
                 },
             },
-            background: tint(l.text, 1.0).into(),
+            background: l.text.into(),
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
         },

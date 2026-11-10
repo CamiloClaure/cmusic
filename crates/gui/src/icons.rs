@@ -45,6 +45,7 @@ icons! {
     play_next, "none", r##"<path d="M3 6h11"/><path d="M3 12h7"/><path d="M3 18h11"/><polygon points="16 9 22 13.5 16 18 16 9" fill="#000"/>"##;
     x, "none", r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#;
     search, "none", r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#;
+    chevron_right, "none", r#"<path d="m9 18 6-6-6-6"/>"#;
     chevron_left, "none", r#"<path d="m15 18-6-6 6-6"/>"#;
     volume, "none", r#"<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>"#;
     music, "none", r#"<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>"#;

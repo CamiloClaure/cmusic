@@ -44,7 +44,7 @@ Keys other than the Ctrl ones do nothing while a text field has focus.
 Below 980 px of window width the queue column is hidden; a button in the bar swaps it in for the main area.
 
 ## Themes
-The desktop app reads user themes from `themes/<name>.json` in the config folder (`~/.config/cmusic/themes/` on Linux). Copy a preset from `themes/` in this repo to start. A file may hold only the keys it changes; unknown keys or bad values are reported in the status line and the previous look stays.
+The desktop app reads user themes from `themes/<name>.json` in the config folder (`~/.config/cmusic/themes/` on Linux). The bundled presets are written there on first run (only if the folder does not exist yet), so copy one to start. A file may hold only the keys it changes; unknown keys or bad values are reported in the status line and the previous look stays.
 
 Press the `Theme: <name>` button next to "Lyrics" to cycle (Default, then each file by name), and `Ctrl+R` to re-read the current file after editing. The choice is remembered. Numbers are clamped to the range shown.
 
