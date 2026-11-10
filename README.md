@@ -2,7 +2,7 @@
 
 Lightweight YouTube Music player written in Rust: a terminal app (`cmusic`) and a native desktop app (`cmusic-gui`) over one shared core.
 
-Status: early development, not released.
+Status: early development, not released. Plays end to end on Linux; account features and other platforms are untested.
 
 Unofficial. Not affiliated with Google or YouTube. You need your own YouTube Music account, and a Premium account for Premium-only tracks.
 
@@ -10,7 +10,7 @@ Unofficial. Not affiliated with Google or YouTube. You need your own YouTube Mus
 Existing clients break playback after a few songs, eat memory (Electron), treat the account library as an afterthought, and crash when YouTube changes a field. cmusic keeps all playback logic in one pure state machine, plays through libmpv, and reads your library, likes and playlists straight from your account.
 
 ## Runtime needs
-- `libmpv` 0.35 or newer
+- `libmpv` 0.38 or newer
 - `yt-dlp` and `deno` on PATH (stream resolving)
 
 ## Login

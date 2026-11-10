@@ -1,6 +1,6 @@
 # cmusic: YouTube Music player in Rust (TUI + GUI)
 
-Revision 2 (2026-11-10). Changes from revision 1 are listed in "What changed and why" at the bottom.
+Revision 2 (2026-11-10). Build status is at the bottom. Changes from revision 1 are listed in "What changed and why" at the bottom.
 
 ## Context
 No official YouTube Music desktop app exists. Existing clients (pear-desktop, ytmdesktop, Kaset, SimpMusic, youtui, ytermusic) share the same flaws, found in their GitHub issues:
@@ -27,7 +27,8 @@ cmusic/                      cargo workspace, lives in ~/personal/cmusic
 Pinned crates (checked on crates.io 2026-11-10): `ytmapi-rs` 0.3, `libmpv2` 7 (no default features, the `render` feature is video only), `souvlaki` 0.9 with `use_zbus` (no libdbus build dependency), `rookie` 0.5, `ratatui` 0.30, `iced` 0.14, `directories` 6, `tokio`, `serde`/`serde_json`, `reqwest` (comes with ytmapi-rs).
 
 - **Catalog:** `ytmapi-rs` (search, library, playlists, likes, radio, lyrics).
-- **Streams:** our own resolver runs `yt-dlp -j -f bestaudio/best --no-playlist [--cookies <file>] https://music.youtube.com/watch?v=<id>` and reads `url` and `http_headers` from the JSON. mpv gets the direct URL plus those headers (without the headers googlevideo answers 403, verified). This replaces mpv's `ytdl_hook`, which needs a Lua-enabled libmpv and is missing in several builds (conda-forge for one). Bonus: yt-dlp's stderr becomes the error message shown to the user. Runtime needs `yt-dlp` and `deno` on PATH.
+- **Streams:** our own resolver runs `yt-dlp -j -f bestaudio/best --no-playlist [--cookies <file>] https://music.youtube.com/watch?v=<id>` and reads `url` and `http_headers` from the JSON. mpv gets the direct URL plus those headers. The JSON also carries `available_at`: YouTube answers 403 on a stream URL used before that time (about 4 s after it is issued, verified), so the resolver holds the URL back until then. This replaces mpv's `ytdl_hook`, which needs a Lua-enabled libmpv and is missing in several builds (conda-forge for one). Bonus: yt-dlp's stderr becomes the error message shown to the user. Runtime needs `yt-dlp` and `deno` on PATH.
+  - Cost: the first play and every manual skip take 5 to 10 s (yt-dlp plus the wait). Gapless advance is unaffected because the next track is resolved ahead. Caching the resolved next stream for a manual Next is the first speed-up to add.
   - URLs expire in about 6 hours, so only the current and the next track are ever resolved, just in time. A restored session re-resolves.
 - **Audio:** `libmpv2`. `video=no`, `gapless-audio=yes`, `prefetch-playlist=yes`, `stop-screensaver=no`, `audio-display=no`. mpv's playlist holds at most two entries (current and next). Any queue edit that changes "next" removes and re-appends it, so mpv can never drift from our queue.
 - **One contract for both front ends** (`core/src/types.rs`, written before any worker starts):
@@ -43,7 +44,7 @@ Pinned crates (checked on crates.io 2026-11-10): `ytmapi-rs` 0.3, `libmpv2` 7 (n
 ### 0. Toolchain (done, root-free, WSL Ubuntu 20.04)
 - No sudo on the box and apt only has mpv 0.32, too old for `libmpv2` 7. Installed instead: rustup stable (cargo 1.99), micromamba env `cmusic` from conda-forge (mpv 0.42 with `libmpv.so.2`), `yt-dlp` and `deno` binaries in `~/.local/bin`.
 - `source ~/.local/cmusic-env.sh` before any cargo command (sets PATH and the `-L` / rpath flags for libmpv).
-- Verified: a `libmpv2` probe links and runs; `yt-dlp -j` plus headers plays 3 s through mpv with `ao=null`.
+- Verified: a `libmpv2` probe links and runs; a resolved stream plays through mpv with `ao=null` once `available_at` has passed.
 
 ### 1. Repo bootstrap
 - Workspace with the 3 crates, all dependencies declared up front (workers do not touch `Cargo.toml` without saying so), `types.rs` contract, GPL-3.0 `LICENSE`, short `README.md` (goal, status, unofficial, own account needed, runtime needs), `.gitignore`, `rustfmt.toml`.
@@ -150,3 +151,13 @@ T1-T4 run in parallel, then T5, then T6 and T7 in parallel.
 6. **Toolchain reality:** no sudo and Ubuntu 20.04, so libmpv comes from conda-forge. `souvlaki` uses zbus so no libdbus headers are needed.
 7. **Public push and packaging moved after the real-account smoke test.** Nothing unverified goes public, and installers for an app that has not played a Premium track yet are wasted work.
 8. **Cut from v1:** configurable keybindings, Windows taskbar buttons, TOML (state is JSON, nobody hand-edits it). Each returns when asked for.
+
+## Build status (2026-11-10)
+T0 to T7 are merged on `main` (local only, not pushed). 60 unit tests and 10 live tests (network, yt-dlp, libmpv) pass on the WSL box.
+
+Checked by running, without an account:
+- Engine headless: play, lyrics, radio autoplay filling the queue, save and restore.
+- TUI in a pseudo-terminal: search, play, track 1 into track 2, pause, Next while paused, clean exit, about 0 % CPU when idle.
+- GUI under WSLg: starts, a real search renders with album art, 0 % CPU when idle, 123 to 134 MB in a debug build.
+
+Not checked yet: everything in the "Left for Camilo" list above, GUI playback controls, lyrics view and login dialog by hand, browser cookie import, CI on Windows and macOS, real audio output (all runs used `ao=null`).
