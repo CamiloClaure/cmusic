@@ -1,7 +1,7 @@
 //! Thin adapter over libmpv. No playback logic: methods mirror engine effects and
 //! mpv's events come back through a callback from one dedicated thread.
 
-use crate::resolve::Stream;
+pub use crate::player::state::{EndReason, Stream};
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{mpv_end_file_reason, mpv_error, Error, Format, Mpv};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,13 +16,6 @@ pub enum MpvEvent {
     TimePos(f64),
     Duration(f64),
     Buffering(bool),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum EndReason {
-    Eof,
-    Error(String),
-    Stopped,
 }
 
 pub struct MpvPlayer {
@@ -136,20 +129,14 @@ impl MpvPlayer {
 
     /// Append `s` as the gapless next entry.
     pub fn append_next(&self, s: &Stream) {
+        // After a gapless advance the finished entry is still listed: keep it to two.
+        self.clear_next();
         self.loadfile(s, "append");
     }
 
-    /// Remove every playlist entry after the current one.
+    /// Remove every playlist entry except the one playing.
     pub fn clear_next(&self) {
-        let (Ok(count), Ok(pos)) = (
-            self.mpv.get_property::<i64>("playlist-count"),
-            self.mpv.get_property::<i64>("playlist-pos"),
-        ) else {
-            return;
-        };
-        for i in (pos + 1..count).rev() {
-            self.cmd("playlist-remove", &[&i.to_string()]);
-        }
+        self.cmd("playlist-clear", &[]);
     }
 
     pub fn set_pause(&self, paused: bool) {

@@ -6,11 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Stream {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-}
+pub use crate::player::state::Stream;
 
 pub async fn resolve(video_id: &str, cookies: Option<&Path>) -> Result<Stream, String> {
     if video_id.is_empty()
@@ -49,20 +45,31 @@ pub async fn resolve(video_id: &str, cookies: Option<&Path>) -> Result<Stream, S
         let line = line.map_or("yt-dlp failed", |l| l.trim());
         return Err(line.strip_prefix("ERROR: ").unwrap_or(line).to_string());
     }
-    parse(&out.stdout)
+    let (stream, available_at) = parse(&out.stdout)?;
+    // YouTube answers 403 on a stream URL used before its `available_at` time
+    // (a few seconds after it is issued), so hold it back until then.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    let wait = (available_at - now + 0.3).clamp(0.0, 15.0);
+    tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+    Ok(stream)
 }
 
-fn parse(json: &[u8]) -> Result<Stream, String> {
+/// Returns the stream and its `available_at` unix time (0 when absent).
+fn parse(json: &[u8]) -> Result<(Stream, f64), String> {
     #[derive(serde::Deserialize)]
     struct Raw {
         url: Option<String>,
         http_headers: Option<std::collections::BTreeMap<String, String>>,
+        available_at: Option<f64>,
     }
     let raw: Raw = serde_json::from_slice(json).map_err(|e| format!("bad yt-dlp output: {e}"))?;
-    Ok(Stream {
+    let stream = Stream {
         url: raw.url.ok_or("yt-dlp output has no url")?,
         headers: raw.http_headers.unwrap_or_default().into_iter().collect(),
-    })
+    };
+    Ok((stream, raw.available_at.unwrap_or(0.0)))
 }
 
 #[cfg(test)]
@@ -71,7 +78,7 @@ mod tests {
 
     #[test]
     fn parses_fixture() {
-        let s = parse(include_bytes!("../tests/fixtures/ytdlp.json")).unwrap();
+        let (s, _) = parse(include_bytes!("../tests/fixtures/ytdlp.json")).unwrap();
         assert!(s.url.starts_with("https://"));
         assert!(s.headers.iter().any(|(k, _)| k == "User-Agent"));
     }
@@ -79,6 +86,8 @@ mod tests {
     #[test]
     fn rejects_missing_url() {
         assert!(parse(b"{}").is_err());
+        let (_, at) = parse(br#"{"url":"https://x","available_at":12.5}"#).unwrap();
+        assert_eq!(at, 12.5);
         assert!(parse(b"nope").is_err());
     }
 
