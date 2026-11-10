@@ -10,3 +10,5 @@ tokio.workspace = true
 iced = { version = "0.14", features = ["tokio", "image"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde_json.workspace = true
+# Already in the tree through iced; used directly to blur the backdrop.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

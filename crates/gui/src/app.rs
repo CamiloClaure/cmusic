@@ -8,6 +8,18 @@ use iced::widget::image;
 use iced::Size;
 use std::collections::{HashMap, HashSet};
 
+/// A tiny, heavily blurred copy of the art; the renderer stretches it over the window.
+// ponytail: runs inside update (a few ms on a 64 px image); move to a Task if it ever shows.
+fn blurred(bytes: &[u8]) -> Option<image::Handle> {
+    const N: u32 = 64;
+    let img = ::image::load_from_memory(bytes).ok()?;
+    let px = img
+        .resize_to_fill(N, N, ::image::imageops::FilterType::Triangle)
+        .blur(6.0)
+        .to_rgba8();
+    Some(image::Handle::from_rgba(N, N, px.into_raw()))
+}
+
 /// Art is requested for this many rows when a page loads.
 // ponytail: later rows keep the placeholder; request on scroll if that bothers anyone.
 pub const ART_ROWS: usize = 30;
@@ -79,6 +91,8 @@ pub struct State {
     /// Local slider value while the seek slider is being dragged.
     pub drag: Option<f64>,
     pub art: HashMap<String, image::Handle>,
+    /// Blurred art of the current track (keyed by its url), drawn behind everything.
+    pub backdrop: Option<(String, image::Handle)>,
     requested: HashSet<String>,
     pub size: Size,
 }
@@ -97,6 +111,7 @@ impl State {
             notice: None,
             drag: None,
             art: HashMap::new(),
+            backdrop: None,
             requested: HashSet::new(),
             size,
         }
@@ -186,6 +201,7 @@ impl State {
             Message::Art(url, bytes) => {
                 if let Some(b) = bytes {
                     self.art.insert(url, image::Handle::from_bytes(b));
+                    self.refresh_backdrop();
                 }
             }
             Message::Resized(s) => self.size = s,
@@ -212,6 +228,7 @@ impl State {
                     out.art = self.want_art([url]);
                 }
                 self.snapshot = s;
+                self.refresh_backdrop();
             }
             Update::Page { request, result } => {
                 if self.awaiting.as_ref() != Some(&request) {
@@ -245,6 +262,25 @@ impl State {
             }
         }
         out
+    }
+
+    /// Rebuilds the backdrop when the current track's art is loaded and differs from it.
+    fn refresh_backdrop(&mut self) {
+        let Some(url) = self
+            .snapshot
+            .current()
+            .and_then(|t| t.thumbnail_url.as_ref())
+        else {
+            return; // keep the last backdrop while nothing plays
+        };
+        if self.backdrop.as_ref().is_some_and(|(u, _)| u == url) {
+            return;
+        }
+        if let Some(image::Handle::Bytes(_, bytes)) = self.art.get(url) {
+            if let Some(h) = blurred(bytes) {
+                self.backdrop = Some((url.clone(), h));
+            }
+        }
     }
 
     /// Urls not yet loaded or in flight; marks them requested.

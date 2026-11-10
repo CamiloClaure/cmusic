@@ -33,7 +33,7 @@ fn main() -> iced::Result {
     let size = load_size();
     iced::application(move || (State::new(size), Task::none()), update, view::view)
         .title("cmusic")
-        .theme(|_: &State| iced::Theme::Dark)
+        .theme(|_: &State| view::theme())
         .subscription(subscription)
         .window(window::Settings {
             size,
