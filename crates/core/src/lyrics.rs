@@ -87,6 +87,11 @@ fn cache_path(video_id: &str) -> Option<std::path::PathBuf> {
     ok.then(|| cache_dir().join("lyrics").join(format!("{video_id}.json")))
 }
 
+/// LRCLIB answers 400 without both a title and an artist.
+fn searchable(t: &Track) -> bool {
+    !t.title.trim().is_empty() && !t.artists.trim().is_empty()
+}
+
 /// Cache, then LRCLIB. `None` when nothing is found or on any error.
 pub async fn fetch(track: &Track) -> Option<Lyrics> {
     let path = cache_path(&track.video_id);
@@ -96,6 +101,9 @@ pub async fn fetch(track: &Track) -> Option<Lyrics> {
         .and_then(|b| serde_json::from_slice::<Raw>(&b).ok())
     {
         return raw.lyrics();
+    }
+    if !searchable(track) {
+        return None;
     }
     let raw = match lrclib(track).await {
         Ok(r) => r,
@@ -201,6 +209,20 @@ mod tests {
         assert_eq!(current_line(&l, 20.0), Some(1));
         assert_eq!(current_line(&l, 999.0), Some(1));
         assert_eq!(current_line(&plain("x"), 5.0), None);
+    }
+
+    #[test]
+    fn no_lookup_without_title_and_artist() {
+        let t = |title: &str, artists: &str| Track {
+            video_id: "x".into(),
+            title: title.into(),
+            artists: artists.into(),
+            album: None,
+            duration_secs: None,
+            thumbnail_url: None,
+        };
+        assert!(searchable(&t("Song", "Band")));
+        assert!(!searchable(&t("", "Band")) && !searchable(&t("Song", " ")));
     }
 
     #[test]

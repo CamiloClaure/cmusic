@@ -99,14 +99,36 @@ impl Queue {
         cursor: Option<usize>,
         shuffle: bool,
         repeat: Repeat,
+        ranks: &[usize],
     ) {
-        // ponytail: only the play order is persisted, so after a restore "shuffle off" keeps
-        // that order. Persist `original` too if users miss their unshuffled order.
         self.shuffle = false;
         self.replace(tracks, 0);
+        // `ranks[i]` is the insertion-order position of play-order entry `i`; anything that is
+        // not a permutation (old state file, hand edit) keeps the play order as original.
+        let mut seen = vec![false; self.len()];
+        let valid = ranks.len() == self.len()
+            && ranks
+                .iter()
+                .all(|&r| seen.get_mut(r).is_some_and(|s| !std::mem::replace(s, true)));
+        if valid {
+            for (&r, (id, _)) in ranks.iter().zip(&self.entries) {
+                self.original[r] = *id;
+            }
+        }
         self.cursor = cursor.filter(|&c| c < self.len());
         self.shuffle = shuffle;
         self.repeat = repeat;
+    }
+
+    /// For each play-order entry, its position in insertion order (what `restore` takes back).
+    pub fn original_ranks(&self) -> Vec<usize> {
+        let rank: HashMap<u64, usize> = self
+            .original
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+        self.entries.iter().map(|(id, _)| rank[id]).collect()
     }
 
     /// Add at the end.
@@ -131,8 +153,10 @@ impl Queue {
         self.entries.splice(c + 1..c + 1, new);
     }
 
-    /// Remove the track at `index`. Removing the current track makes the following one current
-    /// (none when it was the last). Returns false when `index` is out of range.
+    /// Remove the track at `index`. Removing the current track makes the following one current;
+    /// when it was the last, the cursor wraps to the first with `Repeat::All` and otherwise
+    /// moves to the new last track (none only when the queue is empty). Returns false when
+    /// `index` is out of range.
     pub fn remove(&mut self, index: usize) -> bool {
         if index >= self.len() {
             return false;
@@ -141,7 +165,14 @@ impl Queue {
         self.original.retain(|&o| o != id);
         self.cursor = match self.cursor {
             Some(c) if index < c => Some(c - 1),
-            Some(c) if index == c && c >= self.len() => None,
+            Some(c) if index == c && c >= self.len() => {
+                let last = self.len().checked_sub(1);
+                if self.repeat == Repeat::All {
+                    last.map(|_| 0)
+                } else {
+                    last
+                }
+            }
             other => other,
         };
         true
@@ -301,7 +332,14 @@ mod tests {
         }
         let mut last = q("a b", 1);
         last.remove(1);
-        assert_eq!(last.cursor(), None);
+        assert_eq!(last.cursor(), Some(0));
+        let mut wrap = q("a b c", 2);
+        wrap.set_repeat(Repeat::All);
+        wrap.remove(2);
+        assert_eq!(wrap.cursor(), Some(0));
+        let mut one = q("a", 0);
+        one.remove(0);
+        assert_eq!(one.cursor(), None);
     }
 
     #[test]
@@ -335,6 +373,24 @@ mod tests {
         assert_eq!(sorted.join(" "), "a b c d e f g h");
         q.toggle_shuffle();
         assert_eq!((ids(&q).as_str(), cur(&q)), ("a b c d e f g h", "d"));
+    }
+
+    #[test]
+    fn restore_brings_back_the_original_order() {
+        let mut a = q("a b c d e f", 2);
+        a.toggle_shuffle();
+        let (shuffled, ranks) = (a.tracks(), a.original_ranks());
+        let mut b = Queue::new(9);
+        b.restore(shuffled, Some(0), true, Repeat::Off, &ranks);
+        b.toggle_shuffle();
+        assert_eq!((ids(&b).as_str(), cur(&b)), ("a b c d e f", "c"));
+        // Old state files (no ranks) and nonsense ranks keep the saved order.
+        for bad in [&[][..], &[0, 0, 1, 2, 3, 4], &[9, 1, 2, 3, 4, 5]] {
+            let mut c = Queue::new(9);
+            c.restore(a.tracks(), Some(0), true, Repeat::Off, bad);
+            c.toggle_shuffle();
+            assert_eq!(ids(&c), ids(&a));
+        }
     }
 
     #[test]

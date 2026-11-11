@@ -61,6 +61,8 @@ pub enum Event {
     Restored {
         /// Play order, as in `Snapshot::queue`.
         queue: Vec<Track>,
+        /// `Queue::original_ranks`: empty for a state file from before it was saved.
+        original: Vec<usize>,
         cursor: Option<usize>,
         position_secs: f64,
         volume: u8,
@@ -85,8 +87,10 @@ pub enum Effect {
     ClearNext,
     /// Set mpv's `pause` property.
     SetPause(bool),
-    /// Absolute seek, seconds.
+    /// Absolute seek, seconds. Lands on the nearest cue point: cheap, for dragging.
     Seek(f64),
+    /// Absolute seek to the exact sample, for resuming a saved position.
+    SeekExact(f64),
     /// 0..=100.
     SetVolume(u8),
     /// Loudness normalization on or off.
@@ -95,6 +99,8 @@ pub enum Effect {
     Stop,
     /// Fetch radio tracks for this seed video id, answer with `RadioFetched`.
     FetchRadio(String),
+    /// Tell the user something, once (`Update::Notice`).
+    Notice(String),
     /// Save the session. Always the last effect when present.
     Persist,
 }
@@ -153,6 +159,11 @@ impl State {
             resume_at: None,
             retried: false,
         }
+    }
+
+    /// For `Saved`: see `Queue::original_ranks`.
+    pub fn original_ranks(&self) -> Vec<usize> {
+        self.queue.original_ranks()
     }
 
     /// Video ids whose stream the player wants resolved now: the current track and mpv's next.
@@ -241,6 +252,10 @@ impl State {
                 fx.push(Effect::Persist);
                 if !was_current {
                     self.sync_next(fx);
+                } else if index >= self.queue.len() && self.queue.repeat() != Repeat::All {
+                    // The last track went: stop, the cursor sits on the new last one.
+                    self.resume_at = None;
+                    self.go_idle(fx);
                 } else if matches!(self.status, Status::Idle | Status::Error) {
                     self.resume_at = None;
                     self.position = 0.0;
@@ -255,6 +270,14 @@ impl State {
                 self.resume_at = None;
                 self.go_idle(fx);
                 fx.push(Effect::Persist);
+            }
+            // A queue without a cursor (restored that way, or emptied of its current track) must
+            // not leave the transport dead: the first track starts.
+            Command::TogglePause | Command::Next | Command::Prev
+                if self.queue.cursor().is_none() && self.queue.jump(0) =>
+            {
+                self.unpause(fx);
+                self.change_track(fx);
             }
             Command::TogglePause => match self.status {
                 _ if self.queue.current().is_none() => {}
@@ -278,16 +301,16 @@ impl State {
             }
             Command::Prev => {
                 if self.loaded() && self.position > 3.0 {
-                    self.seek(0.0, fx);
+                    self.seek(0.0, false, fx);
                 } else if self.queue.go_back() {
                     self.change_track(fx);
                 } else {
-                    self.seek(0.0, fx);
+                    self.seek(0.0, false, fx);
                 }
             }
-            Command::SeekTo(secs) => self.seek(secs, fx),
+            Command::SeekTo(secs) => self.seek(secs, false, fx),
             Command::SeekBy(delta) => {
-                self.seek(self.resume_at.unwrap_or(self.position) + delta, fx)
+                self.seek(self.resume_at.unwrap_or(self.position) + delta, false, fx)
             }
             Command::SetVolume(volume) => {
                 self.volume = volume.min(100);
@@ -364,7 +387,7 @@ impl State {
         }
     }
 
-    fn seek(&mut self, secs: f64, fx: &mut Vec<Effect>) {
+    fn seek(&mut self, secs: f64, exact: bool, fx: &mut Vec<Effect>) {
         if self.status == Status::Loading {
             // Applied by `FileLoaded`; shown meanwhile.
             self.resume_at = Some(secs.max(0.0)); // max() also turns NaN into 0
@@ -373,13 +396,19 @@ impl State {
         if !self.loaded() {
             return;
         }
-        let max = if self.duration > 0.0 {
-            self.duration
+        // Never to the very end: a seek there can land back on a cue point before it, and
+        // the track finishing by itself is what moves on gaplessly.
+        let max = if self.duration > 2.0 {
+            self.duration - 1.0
         } else {
             f64::INFINITY
         };
         self.position = secs.max(0.0).min(max); // max() also turns NaN into 0
-        fx.push(Effect::Seek(self.position));
+        fx.push(if exact {
+            Effect::SeekExact(self.position)
+        } else {
+            Effect::Seek(self.position)
+        });
     }
 
     /// Make mpv's next entry match the queue, and ask for radio when the queue runs low.
@@ -422,6 +451,14 @@ impl State {
     fn fail(&mut self, message: String, fx: &mut Vec<Effect>) {
         self.failures = self.failures.saturating_add(1);
         self.retried = false;
+        // `last_error` is cleared as soon as the next track plays; the notice is what stays.
+        let title = self.queue.current().map_or("track", |t| t.title.as_str());
+        let moves_on = self.failures < 3 && self.queue.peek_next(true).is_some();
+        fx.push(Effect::Notice(if moves_on {
+            format!("Skipped \"{title}\": {message}")
+        } else {
+            format!("Could not play \"{title}\": {message}")
+        }));
         self.last_error = Some(message);
         self.resume_at = None;
         if self.failures >= 3 {
@@ -448,6 +485,12 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
             if st.awaiting(&video_id) {
                 st.load_sent = true;
                 fx.push(Effect::Load(stream));
+                // One answer serves both requests when the next track is the same video
+                // (a duplicate queue entry, repeat one); the next one is asked again after
+                // `FileLoaded`, instantly from the engine's cache.
+                if matches!(&st.next, Next::Resolving(id) if *id == video_id) {
+                    st.next = Next::Empty;
+                }
             } else if matches!(&st.next, Next::Resolving(id) if *id == video_id) {
                 if st.loaded() {
                     st.next = Next::Appended(video_id);
@@ -461,6 +504,9 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
         }
         Event::ResolveFailed { video_id, message } => {
             if st.awaiting(&video_id) {
+                if matches!(&st.next, Next::Resolving(id) if *id == video_id) {
+                    st.next = Next::Empty; // same answer, see `Resolved`
+                }
                 st.fail(message, &mut fx);
             } else if matches!(&st.next, Next::Resolving(id) if *id == video_id) {
                 st.next = Next::Empty; // retried when it becomes current
@@ -472,7 +518,7 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
             st.retried = false;
             st.last_error = None;
             if let Some(secs) = st.resume_at.take() {
-                st.seek(secs, &mut fx);
+                st.seek(secs, true, &mut fx);
             }
             st.sync_next(&mut fx);
         }
@@ -538,6 +584,12 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
         Event::AppendFailed if matches!(st.next, Next::Appended(_)) => st.next = Next::Empty,
         Event::RadioFetched(seed, tracks) if st.radio_pending.as_ref() == Some(&seed) => {
             st.radio_pending = None;
+            // Asked for under repeat off; repeat All or One since then wants no more tracks.
+            let tracks = if st.queue.repeat() == Repeat::Off {
+                tracks
+            } else {
+                Vec::new()
+            };
             let mut new: Vec<Track> = Vec::new();
             for t in tracks {
                 if !st.queue.contains(&t.video_id) && !new.iter().any(|n| n.video_id == t.video_id)
@@ -572,6 +624,7 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
         }
         Event::Restored {
             queue,
+            original,
             cursor,
             position_secs,
             volume,
@@ -580,7 +633,7 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
             normalize,
         } => {
             st.go_idle(&mut fx);
-            st.queue.restore(queue, cursor, shuffle, repeat);
+            st.queue.restore(queue, cursor, shuffle, repeat, &original);
             st.position = position_secs.max(0.0);
             st.resume_at = (st.position > 0.0).then_some(st.position);
             st.volume = volume.min(100);
@@ -603,7 +656,9 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use Effect::{AppendNext, ClearNext, FetchRadio, Load, Persist, Resolve, Seek, SetPause, Stop};
+    use Effect::{
+        AppendNext, ClearNext, FetchRadio, Load, Persist, Resolve, Seek, SeekExact, SetPause, Stop,
+    };
 
     fn track(id: &str) -> Track {
         Track {
@@ -711,7 +766,8 @@ mod tests {
                 Loading, Some(1)),
             ("failed append falls back to a normal advance", playing(ABCDE, 0),
                 vec![resolved("b"), AppendFailed, eof()],
-                vec![AppendNext(stream("b")), Stop, r("b"), r("c"), Persist], Loading, Some(1)),
+                vec![AppendNext(stream("b")), Stop,
+                     r("b"), r("c"), Persist], Loading, Some(1)),
             ("last tracks trigger autoplay fetch", State::new(1), vec![play("a b", 0)],
                 vec![r("a"), r("b"), FetchRadio("a".into()), Persist], Loading, Some(0)),
             ("radio continues the queue", playing("a", 0),
@@ -724,7 +780,7 @@ mod tests {
             ("queue end without radio goes idle", playing("a", 0),
                 vec![radio("a", ""), eof()], vec![Stop], Idle, Some(0)),
             ("failed resolve skips", State::new(1), vec![play(ABCDE, 0), failed("a")],
-                vec![r("a"), r("b"), Persist, r("c"), Persist], Loading, Some(1)),
+                vec![r("a"), r("b"), Persist, Effect::Notice("Skipped \"a\": a failed".into()), r("c"), Persist], Loading, Some(1)),
             ("load error retries once with a fresh resolve", State::new(1),
                 vec![play(ABCDE, 0), resolved("a"), EndFile(EndReason::Error("403".into()))],
                 vec![r("a"), r("b"), Persist, load("a"), Effect::Forget("a".into()), r("a"),
@@ -733,20 +789,28 @@ mod tests {
                 vec![play(ABCDE, 0), resolved("a"), EndFile(EndReason::Error("403".into())),
                      resolved("a"), EndFile(EndReason::Error("403".into()))],
                 vec![r("a"), r("b"), Persist, load("a"), Effect::Forget("a".into()), r("a"),
-                     r("b"), load("a"), r("c"), Persist], Loading, Some(1)),
+                     r("b"), load("a"), Effect::Notice("Skipped \"a\": 403".into()), r("c"),
+                     Persist], Loading, Some(1)),
             ("playback error with appended next stops mpv's own advance", playing(ABCDE, 0),
                 vec![resolved("b"), EndFile(EndReason::Error("net".into()))],
-                vec![AppendNext(stream("b")), Stop, r("b"), r("c"), Persist], Loading, Some(1)),
+                vec![AppendNext(stream("b")), Effect::Notice("Skipped \"a\": net".into()), Stop,
+                     r("b"), r("c"), Persist], Loading, Some(1)),
             ("three failures stop in Error", State::new(1),
                 vec![play(ABCDE, 0), failed("a"), failed("b"), failed("c"), resolved("d"),
                      resolved("c"), FileLoaded],
-                vec![r("a"), r("b"), Persist, r("c"), Persist, r("d"), FetchRadio("c".into()), Persist],
+                vec![r("a"), r("b"), Persist, Effect::Notice("Skipped \"a\": a failed".into()),
+                     r("c"), Persist, Effect::Notice("Skipped \"b\": b failed".into()), r("d"),
+                     FetchRadio("c".into()), Persist,
+                     Effect::Notice("Could not play \"c\": c failed".into())],
                 Error, Some(2)),
             ("FileLoaded resets the failure count", State::new(1),
                 vec![play(ABCDE, 0), failed("a"), failed("b"), resolved("c"), FileLoaded,
                      EndFile(EndReason::Error("x".into())), failed("d")],
-                vec![r("a"), r("b"), Persist, r("c"), Persist, r("d"), FetchRadio("c".into()), Persist,
-                     load("c"), r("e"), Persist, Persist], Loading, Some(4)),
+                vec![r("a"), r("b"), Persist, Effect::Notice("Skipped \"a\": a failed".into()),
+                     r("c"), Persist, Effect::Notice("Skipped \"b\": b failed".into()), r("d"),
+                     FetchRadio("c".into()), Persist, load("c"),
+                     Effect::Notice("Skipped \"c\": x".into()), r("e"), Persist,
+                     Effect::Notice("Skipped \"d\": d failed".into()), Persist], Loading, Some(4)),
             ("stopped end-file is ignored", playing(ABCDE, 0),
                 vec![EndFile(EndReason::Stopped)], vec![], Playing, Some(0)),
             ("pause and resume", playing(ABCDE, 0),
@@ -782,6 +846,8 @@ mod tests {
                 Loading, Some(1)),
             ("remove the last current track goes idle", playing("a", 0),
                 vec![cmd(Command::RemoveFromQueue(0))], vec![Stop, Persist], Idle, None),
+            ("remove the current last track stops on the new last", playing("a b", 1),
+                vec![cmd(Command::RemoveFromQueue(1))], vec![Stop, Persist], Idle, Some(0)),
             ("prev late in a track restarts it", playing(ABCDE, 2),
                 vec![Event::TimePos(10.0), cmd(Command::Prev)], vec![Seek(0.0)], Playing, Some(2)),
             ("prev early goes back", playing(ABCDE, 2),
@@ -797,6 +863,127 @@ mod tests {
             assert_eq!(got, want, "{name}");
             assert_eq!((st.status, st.queue.cursor()), (status, cursor), "{name}");
         }
+    }
+
+    /// Plays `ids` through, answering every Resolve from a perfect engine cache, until the
+    /// queue runs out. Returns the video ids in the order they got loaded.
+    fn play_through(ids: &str, repeat: Option<Repeat>, shuffle: bool) -> Vec<String> {
+        let mut st = State::new(5);
+        if let Some(r) = repeat {
+            st.queue.set_repeat(r);
+        }
+        if shuffle {
+            st.queue.toggle_shuffle();
+        }
+        let mut loaded = Vec::new();
+        let mut fx = reduce(&mut st, play(ids, 0));
+        for _ in 0..40 {
+            // Answer in order, like the engine: Resolve is a cache hit or one job's answer.
+            let mut more = Vec::new();
+            let mut asked: Vec<String> = Vec::new();
+            for e in std::mem::take(&mut fx) {
+                match e {
+                    // A second request for a running job is served by the same one answer.
+                    Resolve(id) if asked.contains(&id) => {}
+                    Resolve(id) => {
+                        more.extend(reduce(&mut st, resolved(&id)));
+                        asked.push(id);
+                    }
+                    Load(_) => {
+                        more.extend(reduce(&mut st, Event::FileLoaded));
+                        loaded.push(st.queue.current().unwrap().video_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+            if more.is_empty() {
+                // Nothing pending: the track ends by itself (mpv moves to the appended entry
+                // when there is one, which the reducer handles the same way).
+                if st.status == Status::Idle || loaded.len() >= 6 {
+                    break;
+                }
+                if st.status == Status::Loading {
+                    // mpv started the appended entry by itself.
+                    more = reduce(&mut st, Event::FileLoaded);
+                    loaded.push(st.queue.current().unwrap().video_id.clone());
+                } else {
+                    more = reduce(&mut st, Event::EndFile(EndReason::Eof));
+                }
+            }
+            fx = more;
+        }
+        loaded
+    }
+
+    #[test]
+    fn the_same_track_twice_in_a_row_keeps_playing() {
+        let want = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for (ids, repeat, shuffle, expect) in [
+            ("a a b", None, false, "a a b"),
+            ("a a a", None, false, "a a a"),
+            ("a b a", None, false, "a b a"),
+            ("a a", Some(Repeat::All), false, "a a a a a a"),
+            ("a", Some(Repeat::One), false, "a a a a a a"),
+            ("a", Some(Repeat::All), false, "a a a a a a"),
+            ("a a b b", None, true, ""), // shuffled: only that all four play
+        ] {
+            let got = play_through(ids, repeat, shuffle);
+            if shuffle {
+                let mut sorted = got.clone();
+                sorted.sort();
+                assert_eq!(sorted, want("a a b b"), "{ids} shuffled");
+            } else {
+                assert_eq!(got, want(expect), "{ids} {repeat:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn transport_never_dies_for_lack_of_a_cursor() {
+        use Event::FileLoaded;
+        for command in [Command::TogglePause, Command::Next, Command::Prev] {
+            let mut st = State::new(1);
+            feed(&mut st, vec![play("a b", 0)]);
+            st.queue.clear();
+            st.queue.append(tracks("a b")); // a queue with no cursor
+            assert_eq!(st.queue.cursor(), None);
+            let fx = feed(&mut st, vec![cmd(command.clone())]);
+            assert!(fx.contains(&r("a")), "{command:?}: {fx:?}");
+            assert_eq!(st.queue.cursor(), Some(0));
+            feed(&mut st, vec![resolved("a"), FileLoaded]);
+            assert_eq!(st.status, Status::Playing);
+        }
+        // The removed last track: Repeat::All wraps and plays, otherwise stop on the new last.
+        let mut st = playing("a b c", 2);
+        st.queue.set_repeat(Repeat::All);
+        let fx = feed(&mut st, vec![cmd(Command::RemoveFromQueue(2))]);
+        assert!(
+            fx.contains(&r("a")) && st.queue.cursor() == Some(0),
+            "{fx:?}"
+        );
+        let mut st = playing("a b c", 2);
+        feed(&mut st, vec![cmd(Command::RemoveFromQueue(2))]);
+        assert_eq!((st.status, st.queue.cursor()), (Status::Idle, Some(1)));
+        for command in [Command::TogglePause, Command::Prev] {
+            let mut st = st.clone();
+            assert!(
+                !feed(&mut st, vec![cmd(command.clone())]).is_empty(),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn radio_arriving_after_repeat_all_is_dropped() {
+        let mut st = playing("a b", 0);
+        feed(&mut st, vec![resolved("b")]);
+        assert_eq!(st.radio_pending.as_deref(), Some("a"));
+        feed(&mut st, vec![cmd(Command::CycleRepeat)]);
+        feed(
+            &mut st,
+            vec![Event::RadioFetched("a".into(), tracks("x y z"))],
+        );
+        assert_eq!(ids(&st), "a b");
     }
 
     #[test]
@@ -828,7 +1015,7 @@ mod tests {
         feed(&mut st, vec![cmd(Command::SeekBy(5.0))]);
         feed(&mut st, vec![resolved("a")]);
         let fx = feed(&mut st, vec![Event::FileLoaded]);
-        assert!(fx.contains(&Seek(35.0)), "{fx:?}");
+        assert!(fx.contains(&SeekExact(35.0)), "{fx:?}");
         assert_eq!(st.snapshot().position_secs, 35.0);
         // A pick of another track drops it.
         let mut st = State::new(1);
@@ -898,7 +1085,10 @@ mod tests {
             feed(&mut st, vec![cmd(Command::Next)]),
             [r("d"), r("e"), Persist]
         );
-        assert_eq!(feed(&mut st, vec![failed("d")]), [Persist]);
+        assert_eq!(
+            feed(&mut st, vec![failed("d")]),
+            [Effect::Notice("Skipped \"d\": d failed".into()), Persist]
+        );
     }
 
     #[test]
@@ -931,6 +1121,7 @@ mod tests {
         let fx = feed(
             &mut st,
             vec![Event::Restored {
+                original: Vec::new(),
                 queue: tracks(ABCDE),
                 cursor: Some(1),
                 position_secs: 42.0,
@@ -950,7 +1141,7 @@ mod tests {
             &mut st,
             vec![cmd(Command::TogglePause), resolved("b"), Event::FileLoaded],
         );
-        assert_eq!(fx, [r("b"), r("c"), load("b"), Seek(42.0)]);
+        assert_eq!(fx, [r("b"), r("c"), load("b"), SeekExact(42.0)]);
     }
 
     #[test]
@@ -974,7 +1165,7 @@ mod tests {
         assert!(!fx.contains(&Stop) && fx.contains(&r("a")), "{fx:?}");
         assert_eq!(st.snapshot().position_secs, 42.0);
         let fx = feed(&mut st, vec![resolved("a"), Event::FileLoaded]);
-        assert!(fx.contains(&Seek(42.0)), "{fx:?}");
+        assert!(fx.contains(&SeekExact(42.0)), "{fx:?}");
     }
 
     #[test]
@@ -983,6 +1174,7 @@ mod tests {
         feed(
             &mut st,
             vec![Event::Restored {
+                original: Vec::new(),
                 queue: tracks(ABCDE),
                 cursor: Some(1),
                 position_secs: 42.0,
@@ -1019,7 +1211,7 @@ mod tests {
             [
                 Effect::SetVolume(100),
                 Persist,
-                Seek(100.0),
+                Seek(99.0), // never the very end
                 Seek(0.0),
                 Seek(0.0)
             ]

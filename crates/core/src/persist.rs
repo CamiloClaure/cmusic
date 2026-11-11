@@ -8,8 +8,11 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct Saved {
-    // ponytail: this is the play-order queue; the original pre-shuffle order is not persisted.
+    /// The play-order queue.
     pub queue: Vec<Track>,
+    /// Insertion-order position of each queue entry (restores the order when shuffle goes off).
+    /// Empty in files from before it was saved.
+    pub original: Vec<usize>,
     pub cursor: Option<usize>,
     pub position_secs: f64,
     pub volume: u8,
@@ -22,6 +25,7 @@ impl From<&Snapshot> for Saved {
     fn from(s: &Snapshot) -> Self {
         Saved {
             queue: s.queue.clone(),
+            original: Vec::new(),
             cursor: s.cursor,
             position_secs: s.position_secs,
             volume: s.volume,
@@ -75,7 +79,10 @@ pub(crate) fn load_from(path: &Path) -> Option<Saved> {
     match serde_json::from_slice(&bytes) {
         Ok(s) => Some(s),
         Err(e) => {
-            log::warn!("ignoring corrupt {}: {e}", path.display());
+            // Keep it for rescue: the next save would overwrite it with a fresh session.
+            let bad = path.with_extension("json.bad");
+            log::warn!("corrupt {} moved to {}: {e}", path.display(), bad.display());
+            let _ = std::fs::rename(path, bad);
             None
         }
     }
@@ -111,6 +118,7 @@ mod tests {
                 duration_secs: Some(10),
                 thumbnail_url: None,
             }],
+            original: vec![0],
             cursor: Some(0),
             position_secs: 12.5,
             volume: 80,
@@ -131,6 +139,18 @@ mod tests {
         assert_eq!(load_from(&path), None);
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_from(&path), None);
+        // Kept as .bad (an older one is replaced), not left to be overwritten.
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(path.with_extension("json.bad")).unwrap(),
+            b"{not json"
+        );
+        std::fs::write(&path, "[2]").unwrap();
+        assert_eq!(load_from(&path), None);
+        assert_eq!(
+            std::fs::read(path.with_extension("json.bad")).unwrap(),
+            b"[2]"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

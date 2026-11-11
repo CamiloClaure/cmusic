@@ -262,8 +262,10 @@ impl MpvPlayer {
         self.prop("pause", paused);
     }
 
-    pub fn seek(&self, secs: f64) {
-        self.cmd("seek", &[&secs.to_string(), "absolute"]);
+    /// `exact`: decode up to the exact sample (restoring a position) instead of the nearest cue.
+    pub fn seek(&self, secs: f64, exact: bool) {
+        let flags = if exact { "absolute+exact" } else { "absolute" };
+        self.cmd("seek", &[&secs.to_string(), flags]);
     }
 
     pub fn set_volume(&self, v: u8) {
@@ -450,7 +452,7 @@ mod tests {
                 }
             })
             .expect("duration event");
-        p.seek(dur - 3.0);
+        p.seek(dur - 3.0, false);
         let evs = collect(&rx, 40, |v| {
             let at = v
                 .iter()
