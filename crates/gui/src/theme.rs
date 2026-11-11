@@ -228,7 +228,10 @@ pub fn load(name: &str) -> Result<Look, String> {
     // serde lists every valid key after "unknown field"; the culprit is what the user needs.
     parse(&text).map_err(|e| {
         let e = e.to_string();
-        format!("{file}: {}", e.split(", expected one of").next().unwrap_or(&e))
+        format!(
+            "{file}: {}",
+            e.split(", expected one of").next().unwrap_or(&e)
+        )
     })
 }
 
@@ -269,9 +272,12 @@ mod tests {
         let l =
             parse(r#"{"font_scale":50,"gap":-3,"radius_panel":999,"backdrop_blur":1e6}"#).unwrap();
         assert_eq!((l.font_scale, l.gap, l.radius_panel), (1.25, 0.0, 32.0));
-        let l = parse(r#"{"font_scale":0.1,"gap":99,"pad":99,"radius_row":99}"#).unwrap();
-        assert_eq!((l.font_scale, l.gap, l.pad, l.radius_row), (0.8, 16.0, 16.0, 24.0));
         assert_eq!(l.backdrop_blur, 30.0);
+        let l = parse(r#"{"font_scale":0.1,"gap":99,"pad":99,"radius_row":99}"#).unwrap();
+        assert_eq!(
+            (l.font_scale, l.gap, l.pad, l.radius_row),
+            (0.8, 16.0, 16.0, 24.0)
+        );
     }
 
     #[test]

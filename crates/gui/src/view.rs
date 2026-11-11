@@ -377,7 +377,11 @@ fn hint<'a>(
 ) -> Element<'a, Message> {
     let mut c = column![].spacing(6).align_x(Center);
     if let Some((t, room)) = title {
-        c = c.push(text(fit(l, t, room, T)).size(sz(l, T)).wrapping(Wrapping::None));
+        c = c.push(
+            text(fit(l, t, room, T))
+                .size(sz(l, T))
+                .wrapping(Wrapping::None),
+        );
     }
     container(c.push(dim(l, msg).center())).center(Fill).into()
 }
@@ -456,11 +460,9 @@ fn main_area(s: &State) -> Element<'_, Message> {
                 list.into()
             }
         }
-        (None, Some((PageRequest::Search(q), _))) => hint(
-            l,
-            None,
-            fit(l, &format!("No results for \"{q}\""), mw, S),
-        ),
+        (None, Some((PageRequest::Search(q), _))) => {
+            hint(l, None, fit(l, &format!("No results for \"{q}\""), mw, S))
+        }
         (None, Some(_)) => hint(l, None, "Nothing here"),
         (None, None) => hint(
             l,
@@ -471,12 +473,7 @@ fn main_area(s: &State) -> Element<'_, Message> {
     column![
         row![]
             .extend(back)
-            .push(head(
-                l,
-                title,
-                mw - back_w,
-                None,
-            ))
+            .push(head(l, title, mw - back_w, None,))
             .spacing(l.pad)
             .align_y(Center),
         body
@@ -722,42 +719,51 @@ fn login(s: &State) -> Element<'_, Message> {
     let mut form = column![state].spacing(l.pad + 2.0).width(fw);
     // The reason (or progress) comes first, at most three lines.
     if let Some(m) = &lg.message {
-        form = form.push(text(fit(l, m, 3.0 * fw, B)).size(sz(l, B)).color(l.accent_a));
+        form = form.push(
+            text(fit(l, m, 3.0 * fw, B))
+                .size(sz(l, B))
+                .color(l.accent_a),
+        );
     }
-    let form = form.push(dim(
-        l,
-        "Three ways to sign in to YouTube Music:\n\
+    let form = form
+        .push(dim(
+            l,
+            "Three ways to sign in to YouTube Music:\n\
          A. Import from browser: reads the cookies of a browser installed on this computer \
          (Firefox, or Chrome, Edge or Brave on Linux and macOS).",
-    ))
-    .push(pill_btn("Import from browser", Message::ImportBrowsers, true))
-    .push(dim(
-        l,
-        "B. Paste your cookie. In your browser, signed in at music.youtube.com:\n\
+        ))
+        .push(pill_btn(
+            "Import from browser",
+            Message::ImportBrowsers,
+            true,
+        ))
+        .push(dim(
+            l,
+            "B. Paste your cookie. In your browser, signed in at music.youtube.com:\n\
          1. Press F12 or Ctrl+Shift+I and open the Network tab.\n\
          2. Reload the page and click a request named \"browse\".\n\
          3. Open Headers, then Request Headers.\n\
          4. Right-click the \"cookie\" value, choose Copy value and paste it here:",
-    ))
-    .push(
-        row![
-            text_input("Cookie: ...", &lg.cookie)
-                .secure(true)
-                .on_input(Message::CookieInput)
-                .on_submit(Message::UseCookie)
-                .padding([8, 14])
-                .size(sz(l, B))
-                .style(field(l)),
-            pill_btn("Use pasted cookie", Message::UseCookie, false),
-        ]
-        .spacing(l.pad)
-        .align_y(Center),
-    )
-    .push(dim(
-        l,
-        "C. In a terminal: cmusic login --file cookies.txt\n\
+        ))
+        .push(
+            row![
+                text_input("Cookie: ...", &lg.cookie)
+                    .secure(true)
+                    .on_input(Message::CookieInput)
+                    .on_submit(Message::UseCookie)
+                    .padding([8, 14])
+                    .size(sz(l, B))
+                    .style(field(l)),
+                pill_btn("Use pasted cookie", Message::UseCookie, false),
+            ]
+            .spacing(l.pad)
+            .align_y(Center),
+        )
+        .push(dim(
+            l,
+            "C. In a terminal: cmusic login --file cookies.txt\n\
          The cookie stays on this computer, in a file only you can read.",
-    ));
+        ));
     // Fixed header (the Close button stays reachable), scrolling body.
     let body = scrollable(container(form).padding(Padding {
         right: RAIL,
