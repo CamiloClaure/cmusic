@@ -23,7 +23,20 @@ static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
 const DEFAULT_SIZE: Size = Size::new(1100.0, 700.0);
 
+/// Under WSLg the Wayland compositor (weston) can stop answering while X11 keeps working, and
+/// winit then waits forever for its first reply. So prefer X11 there; `CMUSIC_WAYLAND=1` opts out.
+fn prefer_x11_on_wsl() {
+    let wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists();
+    if wsl && std::env::var_os("DISPLAY").is_some() && std::env::var_os("CMUSIC_WAYLAND").is_none()
+    {
+        // First thing in `main`, before any thread exists (set/remove_var is not thread safe).
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+}
+
 fn main() -> iced::Result {
+    prefer_x11_on_wsl();
     // ponytail: hwnd stays None so Windows media controls are off; pass the window handle here.
     match engine::start(Options { hwnd: None }) {
         Ok((handle, rx)) => {

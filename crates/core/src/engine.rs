@@ -46,22 +46,21 @@ pub fn start(opts: Options) -> Result<(Handle, UnboundedReceiver<Update>), Strin
     // Raw pointers are not Send; the handle is only passed through to souvlaki.
     let hwnd = opts.hwnd.map(|p| p as usize);
     spawn(persist::state_path(), move |tx| {
-        let events = tx.clone();
-        let mpv = MpvPlayer::new(move |e| {
-            let _ = events.send(Msg::Ev(from_mpv(e)));
-        })?;
+        let mpv = new_mpv(tx.clone())?;
         let api: ApiCell = Arc::new(RwLock::new(None));
         // Taken before anyone can read, so API users wait for the first connection instead of
         // seeing `None`, while startup and playback do not.
         if let Ok(mut slot) = api.clone().try_write_owned() {
             tokio::spawn(async move { *slot = Some(Api::new().await) });
         }
+        let events = tx.clone();
         let media = Media::new(hwnd.map(|h| h as *mut std::ffi::c_void), move |c| {
-            let _ = tx.send(Msg::Cmd(c));
+            let _ = events.send(Msg::Cmd(c));
         });
         let backend = Real {
             mpv,
             api: api.clone(),
+            tx,
         };
         Ok((Box::new(backend) as Box<dyn Backend>, media, api))
     })
@@ -88,19 +87,34 @@ trait Backend {
     fn resolve(&self, video_id: String) -> BoxFuture<'static, Result<Stream, String>>;
     fn radio(&self, video_id: String) -> BoxFuture<'static, Result<Vec<Track>, String>>;
     fn lyrics(&self, track: Track) -> BoxFuture<'static, Option<Lyrics>>;
+    /// A player command has been stuck for too long.
+    fn stalled(&self) -> bool {
+        false
+    }
+    /// Replace the player with a fresh one, abandoning the stuck one.
+    fn restart(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 struct Real {
     mpv: MpvPlayer,
     api: ApiCell,
+    tx: Tx,
+}
+
+fn new_mpv(tx: Tx) -> Result<MpvPlayer, String> {
+    MpvPlayer::new(move |e| {
+        let _ = tx.send(Msg::Ev(from_mpv(e)));
+    })
 }
 
 impl Backend for Real {
     fn play(&self, fx: &Effect) -> Result<(), String> {
         let m = &self.mpv;
         match fx {
-            Effect::Load(s) => return m.load(s),
-            Effect::AppendNext(s) => return m.append_next(s),
+            Effect::Load(s) => m.load(s),
+            Effect::AppendNext(s) => m.append_next(s),
             Effect::ClearNext => m.clear_next(),
             Effect::SetPause(p) => m.set_pause(*p),
             Effect::Seek(secs) => m.seek(*secs),
@@ -109,6 +123,16 @@ impl Backend for Real {
             Effect::Stop => m.stop(),
             Effect::Resolve(_) | Effect::FetchRadio(_) | Effect::Persist => {}
         }
+        Ok(())
+    }
+
+    fn stalled(&self) -> bool {
+        self.mpv.stalled()
+    }
+
+    fn restart(&mut self) -> Result<(), String> {
+        let new = new_mpv(self.tx.clone())?;
+        std::mem::replace(&mut self.mpv, new).abandon();
         Ok(())
     }
 
@@ -191,6 +215,8 @@ fn from_mpv(e: MpvEvent) -> Event {
         MpvEvent::TimePos(t) => Event::TimePos(t),
         MpvEvent::Duration(d) => Event::Duration(d),
         MpvEvent::Buffering(b) => Event::Buffering(b),
+        MpvEvent::Refused { append: true, .. } => Event::AppendFailed,
+        MpvEvent::Refused { message, .. } => Event::EndFile(EndReason::Error(message)),
     }
 }
 
@@ -236,6 +262,7 @@ fn spawn(
                     save_at: None,
                     last_save: Instant::now(),
                     lyrics_for: None,
+                    watchdog_off: false,
                 };
                 engine.run(cmds, msgs).await;
             });
@@ -264,6 +291,8 @@ struct Engine {
     last_save: Instant,
     /// Video id the latest lyrics request is for.
     lyrics_for: Option<String>,
+    /// A restart failed: stop trying.
+    watchdog_off: bool,
 }
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -283,12 +312,17 @@ impl Engine {
             });
         }
         self.emit();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             let save_at = self.save_at;
             let msg = tokio::select! {
                 // Every Handle dropped counts as Quit.
                 c = cmds.recv() => Msg::Cmd(c.unwrap_or(Command::Quit)),
                 Some(m) = msgs.recv() => m,
+                _ = tick.tick() => {
+                    self.watchdog();
+                    continue;
+                }
                 _ = tokio::time::sleep_until(save_at.unwrap_or_else(Instant::now)),
                     if save_at.is_some() => {
                     self.save();
@@ -330,10 +364,31 @@ impl Engine {
     }
 
     fn event(&mut self, e: Event) {
-        for fx in reduce(&mut self.st, e) {
+        let fx = reduce(&mut self.st, e);
+        // Before the effects, so the UI follows the reducer even when an effect is slow.
+        self.emit();
+        for fx in fx {
             self.effect(fx);
         }
         self.emit();
+    }
+
+    /// mpv stuck on a command: replace it and reload the current track where it was.
+    fn watchdog(&mut self) {
+        if self.watchdog_off || !self.backend.stalled() {
+            return;
+        }
+        log::error!("mpv command stuck for over 5 s, restarting the player");
+        match self.backend.restart() {
+            Ok(()) => self.event(Event::PlayerRestarted),
+            Err(e) => {
+                log::error!("restarting the player failed: {e}");
+                self.watchdog_off = true;
+                self.event(Event::EndFile(EndReason::Error(format!(
+                    "player stopped responding ({e})"
+                ))));
+            }
+        }
     }
 
     fn effect(&mut self, fx: Effect) {
@@ -532,6 +587,8 @@ mod tests {
     struct Fake {
         log: Log,
         fail: &'static str,
+        /// Set by any `Seek`, as a real mpv stuck in the command would report; cleared by a restart.
+        stuck: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Backend for Fake {
@@ -541,6 +598,9 @@ mod tests {
                 Effect::AppendNext(s) => (format!("append {}", s.url), s.url.starts_with('!')),
                 fx => (format!("{fx:?}"), false),
             };
+            if matches!(fx, Effect::Seek(_)) {
+                self.stuck.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             self.log.lock().unwrap().push(line);
             if refused {
                 return Err("refused".into());
@@ -560,6 +620,15 @@ mod tests {
                 }
             }
             .boxed()
+        }
+        fn stalled(&self) -> bool {
+            self.stuck.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn restart(&mut self) -> Result<(), String> {
+            self.stuck
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.log.lock().unwrap().push("restart".into());
+            Ok(())
         }
         fn radio(&self, _: String) -> BoxFuture<'static, Result<Vec<Track>, String>> {
             async { Ok(Vec::new()) }.boxed()
@@ -584,6 +653,7 @@ mod tests {
         let fake = Fake {
             log: log.clone(),
             fail,
+            stuck: Default::default(),
         };
         let (handle, rx) = spawn(dir.join("state.json"), move |tx| {
             inject_tx.send(tx).unwrap();
@@ -709,6 +779,53 @@ mod tests {
         assert!(snaps
             .iter()
             .any(|s| s.cursor == Some(2) && s.last_error.as_deref() == Some("refused")));
+    }
+
+    #[tokio::test]
+    async fn stuck_seek_does_not_freeze_and_restarts_the_player() {
+        let r = rig("stuck", "");
+        r.handle.send(play(&["a", "b"]));
+        r.wait_for("load a").await;
+        r.ev(Event::FileLoaded);
+        r.wait_for("append b").await;
+        r.ev(Event::TimePos(40.0));
+        // Through the same channel as the events, to keep the order.
+        r.inject.send(Msg::Cmd(Command::SeekTo(100.0))).unwrap();
+        r.wait_for("Seek(100.0)").await;
+        // The seek never completes, yet commands and events keep being processed...
+        r.inject.send(Msg::Cmd(Command::SetVolume(33))).unwrap();
+        r.wait_for("SetVolume(33)").await;
+        // ...and the watchdog replaces the player and reloads the track where it was.
+        r.wait_for("restart").await;
+        r.wait_for("SetVolume(33)").await;
+        for _ in 0..200 {
+            if r.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| *l == "load a")
+                .count()
+                == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        r.ev(Event::FileLoaded);
+        let snaps = r.finish().await;
+        assert!(snaps
+            .iter()
+            .any(|s| s.volume == 33 && s.position_secs == 100.0));
+        assert!(snaps.iter().any(|s| s.status == Status::Loading
+            && s.position_secs == 100.0
+            && s.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("restarting"))));
+        let last = snaps.last().unwrap();
+        assert_eq!(
+            (last.status, last.last_error.as_deref()),
+            (Status::Playing, None)
+        );
     }
 
     #[tokio::test]

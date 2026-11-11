@@ -22,6 +22,9 @@ pub enum EndReason {
     Eof,
     /// mpv could not open or keep playing it.
     Error(String),
+    /// The audio device could not be opened. Every track would fail the same way, so there is
+    /// no skipping to the next one.
+    NoAudio,
     /// Replaced by `Load` or ended by `Stop`. Always ignored.
     Stopped,
 }
@@ -51,6 +54,8 @@ pub enum Event {
     RadioFetched(String, Vec<Track>),
     /// mpv refused the `AppendNext`: nothing is appended after all.
     AppendFailed,
+    /// The engine replaced a stuck mpv: reload the current track at the position it had.
+    PlayerRestarted,
     /// The saved session, sent once at startup. Comes back `Idle` without playing; the next
     /// `TogglePause` starts the current track and seeks to `position_secs`.
     Restored {
@@ -467,6 +472,13 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
             st.load_sent = matches!(st.next, Next::Appended(_));
             st.fail(message, &mut fx);
         }
+        Event::EndFile(EndReason::NoAudio) if st.load_sent => {
+            fx.push(Effect::Stop);
+            st.load_sent = false;
+            st.next = Next::Empty;
+            st.status = Status::Error;
+            st.last_error = Some("Audio output failed to start".into());
+        }
         Event::PauseChanged(paused) => {
             st.paused = paused;
             if st.loaded() && st.status != Status::Buffering {
@@ -501,6 +513,20 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
                 } else {
                     st.sync_next(&mut fx);
                 }
+            }
+        }
+        Event::PlayerRestarted => {
+            // The new mpv is empty, unpaused, at default volume.
+            fx.push(Effect::SetVolume(st.volume));
+            fx.push(Effect::SetNormalize(st.normalize));
+            if st.paused {
+                fx.push(Effect::SetPause(true));
+            }
+            if st.loaded() || st.status == Status::Loading {
+                st.resume_at = (st.position > 0.0).then_some(st.position);
+                st.load_sent = false; // nothing to `Stop` in the new instance
+                st.start(&mut fx);
+                st.last_error = Some("Player stopped responding, restarting".into());
             }
         }
         Event::Restored {
@@ -830,6 +856,30 @@ mod tests {
             vec![cmd(Command::TogglePause), resolved("b"), Event::FileLoaded],
         );
         assert_eq!(fx, [r("b"), load("b"), Seek(42.0), r("c")]);
+    }
+
+    #[test]
+    fn no_audio_device_is_an_error_not_a_skip() {
+        let mut st = playing("a b c", 0);
+        let fx = reduce(&mut st, Event::EndFile(EndReason::NoAudio));
+        let snap = st.snapshot();
+        assert_eq!((snap.status, snap.cursor), (Status::Error, Some(0)));
+        assert_eq!(
+            snap.last_error.as_deref(),
+            Some("Audio output failed to start")
+        );
+        assert_eq!(fx, [Stop]);
+    }
+
+    #[test]
+    fn restart_reloads_the_current_track_at_its_position() {
+        let mut st = playing("a b c", 0);
+        feed(&mut st, vec![Event::TimePos(42.0)]);
+        let fx = reduce(&mut st, Event::PlayerRestarted);
+        assert!(!fx.contains(&Stop) && fx.contains(&r("a")), "{fx:?}");
+        assert_eq!(st.snapshot().position_secs, 42.0);
+        let fx = feed(&mut st, vec![resolved("a"), Event::FileLoaded]);
+        assert!(fx.contains(&Seek(42.0)), "{fx:?}");
     }
 
     #[test]

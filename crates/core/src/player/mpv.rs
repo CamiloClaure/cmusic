@@ -4,9 +4,11 @@
 pub use crate::player::state::{EndReason, Stream};
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{mpv_end_file_reason, mpv_error, Error, Format, Mpv};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MpvEvent {
@@ -16,16 +18,34 @@ pub enum MpvEvent {
     TimePos(f64),
     Duration(f64),
     Buffering(bool),
+    /// mpv refused a `loadfile` (`append`: the gapless next one).
+    Refused {
+        append: bool,
+        message: String,
+    },
 }
 
+/// Work for the command thread; runs in submission order.
+type Job = Box<dyn FnOnce(&Mpv) + Send>;
+
+/// A command running longer than this means mpv is stuck (the audio device, usually).
+const STALL: Duration = Duration::from_secs(5);
+
+/// Commands run on their own thread, so a blocked mpv can never block the caller.
 pub struct MpvPlayer {
-    mpv: Mpv,
+    jobs: Option<Sender<Job>>,
+    /// Start of the running job in ms since `born`, plus 1; 0 when idle.
+    busy: Arc<AtomicU64>,
+    born: Instant,
+    on_event: Arc<dyn Fn(MpvEvent) + Send + Sync>,
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    events: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl MpvPlayer {
-    pub fn new(on_event: impl Fn(MpvEvent) + Send + 'static) -> Result<Self, String> {
+    pub fn new(on_event: impl Fn(MpvEvent) + Send + Sync + 'static) -> Result<Self, String> {
+        let on_event: Arc<dyn Fn(MpvEvent) + Send + Sync> = Arc::new(on_event);
         let mpv = Mpv::with_initializer(|i| {
             for (k, v) in [
                 ("video", "no"),
@@ -38,6 +58,9 @@ impl MpvPlayer {
                 ("idle", "yes"),
                 ("input-default-bindings", "no"),
                 ("audio-client-name", "cmusic"),
+                ("network-timeout", "10"),
+                // Audio seeks land on the nearest cue point: no decoding up to the exact frame.
+                ("hr-seek", "no"),
             ] {
                 // `ytdl` only exists in builds with Lua; without it there is nothing to disable.
                 match i.set_option(k, v) {
@@ -85,7 +108,8 @@ impl MpvPlayer {
 
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let thread = std::thread::Builder::new()
+        let cb = on_event.clone();
+        let events = std::thread::Builder::new()
             .name("mpv-events".into())
             .spawn(move || {
                 let mut last_sec = -1i64;
@@ -97,7 +121,13 @@ impl MpvPlayer {
                         // and drops the event, so every Err here is a failed file.
                         Some(Err(e)) => {
                             log::debug!("mpv event error: {e}");
-                            on_event(MpvEvent::EndFile(EndReason::Error(describe(&e))));
+                            let no_audio =
+                                matches!(&e, Error::Raw(c) if *c == mpv_error::AoInitFailed);
+                            cb(MpvEvent::EndFile(if no_audio {
+                                EndReason::NoAudio
+                            } else {
+                                EndReason::Error(describe(&e))
+                            }));
                             continue;
                         }
                     };
@@ -140,28 +170,87 @@ impl MpvPlayer {
                         _ => continue,
                     };
                     log::debug!("mpv event {out:?}");
-                    on_event(out);
+                    cb(out);
                 }
             })
             .map_err(|e| format!("mpv thread failed: {e}"))?;
 
+        let (jobs, rx) = channel::<Job>();
+        let busy = Arc::new(AtomicU64::new(0));
+        let born = Instant::now();
+        let b = busy.clone();
+        let worker = std::thread::Builder::new()
+            .name("mpv-commands".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    b.store(born.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+                    job(&mpv);
+                    b.store(0, Ordering::Relaxed);
+                }
+                // `mpv` drops here, after the events thread has been joined.
+            })
+            .map_err(|e| format!("mpv commands thread failed: {e}"))?;
+
         Ok(Self {
-            mpv,
+            jobs: Some(jobs),
+            busy,
+            born,
+            on_event,
             stop,
-            thread: Some(thread),
+            events: Some(events),
+            worker: Some(worker),
         })
     }
 
-    /// Replace the playlist and start playing `s`. `Err` when mpv refused the command.
-    pub fn load(&self, s: &Stream) -> Result<(), String> {
-        self.loadfile(s, "replace")
+    /// True when a command has been running for longer than `STALL`.
+    pub fn stalled(&self) -> bool {
+        let start = self.busy.load(Ordering::Relaxed);
+        let now = self.born.elapsed().as_millis() as u64 + 1;
+        start != 0 && now.saturating_sub(start) > STALL.as_millis() as u64
     }
 
-    /// Append `s` as the gapless next entry. `Err` when mpv refused the command.
-    pub fn append_next(&self, s: &Stream) -> Result<(), String> {
+    /// Give up on this instance without waiting for it: it may never finish.
+    pub fn abandon(mut self) {
+        self.shutdown(Duration::ZERO);
+    }
+
+    fn shutdown(&mut self, wait: Duration) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.jobs = None;
+        let (events, worker) = (self.events.take(), self.worker.take());
+        if events.is_none() {
+            return;
+        }
+        let (tx, rx) = channel();
+        // ponytail: a stuck mpv leaks this thread (and itself); there is no way to kill it.
+        let _ = std::thread::Builder::new()
+            .name("mpv-teardown".into())
+            .spawn(move || {
+                events
+                    .into_iter()
+                    .chain(worker)
+                    .for_each(|t| drop(t.join()));
+                let _ = tx.send(());
+            });
+        let _ = rx.recv_timeout(wait);
+    }
+
+    fn send(&self, job: impl FnOnce(&Mpv) + Send + 'static) {
+        if let Some(j) = &self.jobs {
+            let _ = j.send(Box::new(job));
+        }
+    }
+
+    /// Replace the playlist and start playing `s`. A refusal comes back as `MpvEvent::Refused`.
+    pub fn load(&self, s: &Stream) {
+        self.loadfile(s, false);
+    }
+
+    /// Append `s` as the gapless next entry.
+    pub fn append_next(&self, s: &Stream) {
         // After a gapless advance the finished entry is still listed: keep it to two.
         self.clear_next();
-        self.loadfile(s, "append")
+        self.loadfile(s, true);
     }
 
     /// Remove every playlist entry except the one playing.
@@ -170,13 +259,7 @@ impl MpvPlayer {
     }
 
     pub fn set_pause(&self, paused: bool) {
-        let t = std::time::Instant::now();
-        log::debug!("mpv set pause={paused} start");
-        let r = self.mpv.set_property("pause", paused);
-        log::debug!("mpv set pause end {}ms", t.elapsed().as_millis());
-        if let Err(e) = r {
-            log::warn!("mpv pause: {e}");
-        }
+        self.prop("pause", paused);
     }
 
     pub fn seek(&self, secs: f64) {
@@ -184,54 +267,68 @@ impl MpvPlayer {
     }
 
     pub fn set_volume(&self, v: u8) {
-        if let Err(e) = self.mpv.set_property("volume", f64::from(v)) {
-            log::warn!("mpv volume: {e}");
-        }
+        self.prop("volume", f64::from(v));
     }
 
     pub fn set_normalize(&self, on: bool) {
-        if let Err(e) = self
-            .mpv
-            .set_property("af", if on { "loudnorm" } else { "" })
-        {
-            log::warn!("mpv af: {e}");
-        }
+        self.prop("af", if on { "loudnorm" } else { "" });
     }
 
     pub fn stop(&self) {
         self.cmd("stop", &[]);
     }
 
-    fn cmd(&self, name: &str, args: &[&str]) {
-        let t = std::time::Instant::now();
-        log::debug!("mpv command {name} start");
-        let r = self.mpv.command(name, args);
-        log::debug!("mpv command {name} end {}ms", t.elapsed().as_millis());
-        if let Err(e) = r {
-            log::warn!("mpv {name}: {e}");
-        }
+    fn cmd(&self, name: &'static str, args: &[&str]) {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        self.send(move |m| {
+            let t = Instant::now();
+            log::debug!("mpv command {name} start");
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let r = m.command(name, &args);
+            log::debug!("mpv command {name} end {}ms", t.elapsed().as_millis());
+            if let Err(e) = r {
+                log::warn!("mpv {name}: {e}");
+            }
+        });
     }
 
-    fn loadfile(&self, s: &Stream, mode: &str) -> Result<(), String> {
-        let t = std::time::Instant::now();
-        log::debug!("mpv command loadfile {mode} start");
-        let r = self
-            .mpv
-            .command("loadfile", &[&s.url, mode, "-1", &file_options(&s.headers)]);
-        log::debug!(
-            "mpv command loadfile {mode} end {}ms",
-            t.elapsed().as_millis()
-        );
-        r.map_err(|e| format!("mpv could not load the stream ({e})"))
+    fn prop<T: libmpv2::SetData + Send + 'static>(&self, name: &'static str, v: T) {
+        self.send(move |m| {
+            let t = Instant::now();
+            log::debug!("mpv set {name} start");
+            let r = m.set_property(name, v);
+            log::debug!("mpv set {name} end {}ms", t.elapsed().as_millis());
+            if let Err(e) = r {
+                log::warn!("mpv {name}: {e}");
+            }
+        });
+    }
+
+    fn loadfile(&self, s: &Stream, append: bool) {
+        let (url, opts) = (s.url.clone(), file_options(&s.headers));
+        let cb = self.on_event.clone();
+        let mode = if append { "append" } else { "replace" };
+        self.send(move |m| {
+            let t = Instant::now();
+            log::debug!("mpv command loadfile {mode} start");
+            let r = m.command("loadfile", &[&url, mode, "-1", &opts]);
+            log::debug!(
+                "mpv command loadfile {mode} end {}ms",
+                t.elapsed().as_millis()
+            );
+            if let Err(e) = r {
+                cb(MpvEvent::Refused {
+                    append,
+                    message: format!("mpv could not load the stream ({e})"),
+                });
+            }
+        });
     }
 }
 
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        self.shutdown(Duration::from_secs(1));
     }
 }
 
@@ -262,7 +359,6 @@ fn describe(e: &Error) -> String {
     match e {
         Error::Raw(c) if *c == mpv_error::LoadingFailed => "loading failed".into(),
         Error::Raw(c) if *c == mpv_error::UnknownFormat => "unrecognized audio format".into(),
-        Error::Raw(c) if *c == mpv_error::AoInitFailed => "audio output failed to start".into(),
         Error::Raw(c) if *c == mpv_error::NothingToPlay => "nothing to play".into(),
         e => format!("playback failed ({e})"),
     }
@@ -317,7 +413,7 @@ mod tests {
     async fn plays_real_stream() {
         let s = resolve("dQw4w9WgXcQ", None).await.unwrap();
         let (p, rx) = player();
-        p.load(&s).unwrap();
+        p.load(&s);
         let evs = collect(&rx, 30, |v| {
             v.iter()
                 .filter(|e| matches!(e, MpvEvent::TimePos(_)))
@@ -339,8 +435,8 @@ mod tests {
     async fn gapless_transition() {
         let s = resolve("dQw4w9WgXcQ", None).await.unwrap();
         let (p, rx) = player();
-        p.load(&s).unwrap();
-        p.append_next(&s).unwrap();
+        p.load(&s);
+        p.append_next(&s);
         let evs = collect(&rx, 30, |v| {
             v.iter().any(|e| matches!(e, MpvEvent::Duration(_)))
         });
@@ -389,9 +485,9 @@ mod tests {
     async fn load_replaces_playing_file_as_stopped() {
         let s = resolve("dQw4w9WgXcQ", None).await.unwrap();
         let (p, rx) = player();
-        p.load(&s).unwrap();
+        p.load(&s);
         collect(&rx, 30, |v| v.contains(&MpvEvent::FileLoaded));
-        p.load(&s).unwrap();
+        p.load(&s);
         let evs = collect(&rx, 30, |v| v.contains(&MpvEvent::FileLoaded));
         println!("{evs:?}");
         assert!(!evs.contains(&MpvEvent::EndFile(EndReason::Eof)));
@@ -408,8 +504,7 @@ mod tests {
         p.load(&Stream {
             url: "https://127.0.0.1:9/nope".into(),
             headers: vec![],
-        })
-        .unwrap();
+        });
         let evs = collect(&rx, 20, |v| {
             v.iter().any(|e| matches!(e, MpvEvent::EndFile(_)))
         });

@@ -74,6 +74,7 @@ Environment variables (all front ends):
 |---|---|
 | `CMUSIC_LOG=<file>` | Append a log (`<secs> <LEVEL> <target>: <message>`), debug for cmusic and warn for the rest, mpv warnings included. Never holds cookies or stream URLs. `CMUSIC_LOG_LEVEL=trace\|debug\|info\|warn` changes the cmusic level |
 | `CMUSIC_AO=<driver>` | mpv audio output, e.g. `null` without audio or `pulse` |
+| `CMUSIC_WAYLAND=1` | GUI under WSL: keep Wayland instead of falling back to X11 |
 | `CMUSIC_STATE_DIR=<dir>` | Keep session and prefs there, leaving your saved session untouched |
 
 Headless script through the real engine (prints every update, `TTFA <ms> <id>` for time to first audio, `HANG` and exit 3 after 20 s of silence while playing; exit 0 at the end):
@@ -84,7 +85,7 @@ CMUSIC_AO=null cargo run --release -p cmusic-core --example play -- search:"daft
 
 Steps: `play:<id>[,<id>...]`, `search:<query>`, `wait:<secs>`, `seek:<secs>`, `pause`, `resume`, `toggle`, `next`, `prev`, `volume:<0-100>`, `remove:<index>`, `shuffle`, `repeat`, `fetch:<liked|playlists|songs|albums|artists>`, `quit`. The old `play -- <id> [secs]` form still works.
 
-Desktop app script: `CMUSIC_DEMO_SCRIPT="step;step;..."` runs the steps in order and is inert when unset. Under WSLg unset `WAYLAND_DISPLAY` so it uses X11.
+Desktop app script: `CMUSIC_DEMO_SCRIPT="step;step;..."` runs the steps in order and is inert when unset. Under WSL the GUI uses X11 even when `WAYLAND_DISPLAY` is set (WSLg's Wayland compositor can stop answering); `CMUSIC_WAYLAND=1` keeps Wayland.
 
 Steps: `search:<query>`, `waitpage` (next page update, max 30 s), `play:<row>`, `wait:<secs>`, `seek:<secs>` and `seekfrac:<0..1>` (a slider drag), `pause`, `next`, `prev`, `lyrics`, `login`, `theme`, `open:<liked|playlists|songs|albums|artists>`, `state` (one line on stderr), `shot:<path.png>`, `quit`.
 
