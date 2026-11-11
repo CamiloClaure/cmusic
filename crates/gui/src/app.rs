@@ -80,6 +80,8 @@ pub fn trim_bars(bytes: Vec<u8>) -> Vec<u8> {
 /// Art is requested for this many rows when a page loads.
 // ponytail: later rows keep the placeholder; request on scroll if that bothers anyone.
 pub const ART_ROWS: usize = 30;
+/// Decoded art kept before `trim_art` drops what is off screen.
+const ART_MAX: usize = 120;
 /// Rows of a page whose streams are resolved ahead of a click.
 const WARM_ROWS: usize = 3;
 const HISTORY_MAX: usize = 20;
@@ -291,7 +293,9 @@ impl State {
                 self.lyrics_h = h;
                 // Only a move to somewhere we did not ask for is the user's: the first report of a
                 // fresh view and the echo of our own scroll (clamped at the end) are not.
-                let ours = self.lyric_target.is_some_and(|t| (t.min(max) - y).abs() < 2.0);
+                let ours = self
+                    .lyric_target
+                    .is_some_and(|t| (t.min(max) - y).abs() < 2.0);
                 if self.lyric_y.is_some_and(|p| (p - y).abs() >= 1.0) && !ours {
                     self.user_scrolled = Some(self.now);
                 }
@@ -416,6 +420,7 @@ impl State {
             Message::Art(url, bytes) => {
                 if let Some(b) = bytes {
                     self.art.insert(url, image::Handle::from_bytes(b));
+                    self.trim_art();
                     self.refresh_backdrop();
                 }
             }
@@ -649,6 +654,32 @@ impl State {
         v
     }
 
+    /// Keeps the art cache bounded: past `ART_MAX` images, only art that is on screen (page rows,
+    /// queue, current track, backdrop) stays. Dropped urls may be fetched again when they return.
+    fn trim_art(&mut self) {
+        if self.art.len() <= ART_MAX {
+            return;
+        }
+        let mut keep: HashSet<String> = self
+            .snapshot
+            .queue
+            .iter()
+            .filter_map(|t| t.thumbnail_url.clone())
+            .collect();
+        if let Some((_, page)) = &self.current {
+            keep.extend(page.items.iter().take(ART_ROWS).filter_map(thumb));
+        }
+        keep.extend(self.backdrop.as_ref().map(|(u, _)| u.clone()));
+        let requested = &mut self.requested;
+        self.art.retain(|u, _| {
+            let k = keep.contains(u);
+            if !k {
+                requested.remove(u);
+            }
+            k
+        });
+    }
+
     /// Lyrics of the current track, if they arrived.
     pub fn current_lyrics(&self) -> Option<&Lyrics> {
         let id = &self.snapshot.current()?.video_id;
@@ -703,6 +734,24 @@ mod tests {
                 items,
             }),
         })
+    }
+
+    #[test]
+    fn art_cache_keeps_only_on_screen_art_past_the_cap() {
+        let mut s = state();
+        let mut t = track("x");
+        t.thumbnail_url = Some("u0".into());
+        s.update(Message::Open(PageRequest::LikedSongs));
+        s.update(page_update(PageRequest::LikedSongs, vec![Item::Track(t)]));
+        for i in 0..=ART_MAX {
+            let u = format!("u{i}");
+            s.want_art([Some(u.clone())]);
+            s.update(Message::Art(u, Some(vec![0])));
+        }
+        // Over the cap: only the page row's art survives, and the rest may be fetched again.
+        assert_eq!(s.art.keys().collect::<Vec<_>>(), vec!["u0"]);
+        assert_eq!(s.want_art([Some("u5".into())]), vec!["u5".to_string()]);
+        assert!(s.want_art([Some("u0".into())]).is_empty());
     }
 
     #[test]
@@ -1016,7 +1065,9 @@ mod tests {
         s.update(Message::LyricsScrolled(400.0, 0.0, 900.0)); // first report of the view
         assert_eq!(at(&mut s, 5.0), None); // same line
         assert_eq!(at(&mut s, 100.0), want(&s, 10));
-        let Some(Scroll::Lyrics(y)) = want(&s, 10) else { panic!() };
+        let Some(Scroll::Lyrics(y)) = want(&s, 10) else {
+            panic!()
+        };
         s.update(Message::LyricsScrolled(400.0, y, 900.0)); // echo of our own scroll
         assert!(s.user_scrolled.is_none());
         s.update(Message::LyricsScrolled(400.0, y + 90.0, 900.0)); // the user
@@ -1033,7 +1084,9 @@ mod tests {
         s.update(Message::ToggleLyrics); // hide
         let out = s.update(Message::ToggleLyrics); // show
         s.update(Message::LyricsScrolled(400.0, 0.0, 900.0)); // fresh view reports offset 0
-        let Some(Scroll::Lyrics(_)) = out.scroll else { panic!("no scroll on open") };
+        let Some(Scroll::Lyrics(_)) = out.scroll else {
+            panic!("no scroll on open")
+        };
         assert!(s.user_scrolled.is_none());
         // A real scroll holds following, but a seek releases it at once.
         s.update(Message::LyricsScrolled(400.0, 123.0, 900.0));
