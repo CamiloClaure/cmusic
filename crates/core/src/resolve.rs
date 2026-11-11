@@ -90,7 +90,7 @@ async fn run(
 
     let t = std::time::Instant::now();
     let out = match tokio::time::timeout(limit, cmd.output()).await {
-        Err(_) => return Err("timed out".into()),
+        Err(_) => return Err(friendly("timed out")),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err("yt-dlp not found on PATH".into());
         }
@@ -106,9 +106,65 @@ async fn run(
         let stderr = String::from_utf8_lossy(&out.stderr);
         let line = stderr.lines().rev().find(|l| !l.trim().is_empty());
         let line = line.map_or("yt-dlp failed", |l| l.trim());
-        return Err(line.strip_prefix("ERROR: ").unwrap_or(line).to_string());
+        log::debug!("yt-dlp {video_id} {kind} failed: {line}");
+        return Err(friendly(line));
     }
     parse(&out.stdout)
+}
+
+/// A yt-dlp error line as one short sentence for the user. The raw line goes to the log.
+fn friendly(raw: &str) -> String {
+    let mut line = raw.trim();
+    line = line.strip_prefix("ERROR:").unwrap_or(line).trim();
+    // `[youtube] <id>: ` (also `[youtube:tab]`), possibly after more `[..]` tags.
+    while let Some(rest) = line.strip_prefix('[').and_then(|r| r.split_once("] ")) {
+        line = rest.1;
+        if let Some((id, rest)) = line.split_once(": ") {
+            if !id.contains(' ') {
+                line = rest;
+            }
+        }
+    }
+    let low = line.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| low.contains(w));
+    // Order matters: "live stream recording is not available" also says "not available".
+    let short = if has(&["live stream", "live event", "premieres in", "will begin in"]) {
+        "Live streams cannot be played"
+    } else if has(&["private video"]) {
+        "This video is private"
+    } else if has(&["premium"]) {
+        "Only for YouTube Music Premium"
+    } else if has(&[
+        "confirm your age",
+        "age-restricted",
+        "inappropriate for some",
+        "sign in",
+    ]) {
+        "Age-restricted or sign-in required, log in and try again"
+    } else if has(&["country", "region", "geo"]) {
+        "Not available in your region"
+    } else if has(&[
+        "unavailable",
+        "not available",
+        "removed",
+        "does not exist",
+        "terminated",
+        "copyright",
+    ]) {
+        "This video is unavailable"
+    } else if has(&[
+        "timed out",
+        "unable to download",
+        "urlopen",
+        "name resolution",
+        "unreachable",
+        "connection",
+    ]) {
+        "Network problem, check your connection"
+    } else {
+        return line.to_string();
+    };
+    short.into()
 }
 
 /// A private (0600) copy of the cookie file, removed on drop.
@@ -210,6 +266,30 @@ fn parse(json: &[u8]) -> Result<(Stream, f64), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yt_dlp_errors_become_short_sentences() {
+        for (raw, want) in [
+            (
+                "ERROR: [youtube] notavalidid: This video is unavailable",
+                "This video is unavailable",
+            ),
+            (
+                "ERROR: [youtube] jfKfPfyJRdk: This live stream recording is not available.",
+                "Live streams cannot be played",
+            ),
+            ("ERROR: [youtube] x: Private video. Sign in if you've been granted access", "This video is private"),
+            ("ERROR: [youtube] x: Sign in to confirm your age", "Age-restricted or sign-in required, log in and try again"),
+            ("ERROR: [youtube] x: This video is only available to Music Premium members", "Only for YouTube Music Premium"),
+            ("ERROR: [youtube] x: The uploader has not made this video available in your country", "Not available in your region"),
+            ("ERROR: [youtube] x: Unable to download webpage: <urlopen error timed out>", "Network problem, check your connection"),
+            // Unknown: only the prefixes go.
+            ("ERROR: [youtube] abc: Something new happened", "Something new happened"),
+            ("yt-dlp failed", "yt-dlp failed"),
+        ] {
+            assert_eq!(friendly(raw), want, "{raw}");
+        }
+    }
 
     #[test]
     fn parses_fixture() {

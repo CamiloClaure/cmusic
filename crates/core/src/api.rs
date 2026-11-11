@@ -30,25 +30,31 @@ impl std::error::Error for ApiError {}
 
 impl From<ytmapi_rs::Error> for ApiError {
     fn from(e: ytmapi_rs::Error) -> Self {
+        log::warn!("api error: {e}");
         classify(e).0
     }
 }
 
-/// The error plus whether it was a response-shape (parse) failure.
+const OFFLINE: &str = "Cannot reach YouTube Music. Check your connection.";
+const CHANGED: &str = "YouTube changed this page, cmusic needs an update";
+
+/// The user-facing error plus whether it was a response-shape (parse) failure. The library's own
+/// text (JSON paths, URLs) is dropped here; callers log it when it matters.
 fn classify(e: ytmapi_rs::Error) -> (ApiError, bool) {
     let text = e.to_string();
-    match e.into_kind() {
+    let (err, parse) = match e.into_kind() {
         ErrorKind::OtherErrorCodeInResponse {
             code: 401 | 403, ..
-        } => (ApiError::Auth(text), false),
-        ErrorKind::JsonParsing(_) => (ApiError::Other(text), true),
-        _ => (ApiError::Other(text), false),
-    }
+        } => (ApiError::Auth(auth::EXPIRED.into()), false),
+        ErrorKind::JsonParsing(_) => (ApiError::Other(CHANGED.into()), true),
+        ErrorKind::Web { .. } => (ApiError::Other(OFFLINE.into()), false),
+        _ => (ApiError::Other(text.clone()), false),
+    };
+    (err, parse)
 }
 
-// ponytail: ytmapi-rs hides the parse-failure kind behind `?`, so match its message text.
 fn is_parse_fault(e: &ApiError) -> bool {
-    matches!(e, ApiError::Other(m) if m.contains("not found in Api response"))
+    matches!(e, ApiError::Other(m) if m == CHANGED)
 }
 
 /// Maps a suspicious library result using the login check (`None`: could not be checked).
@@ -61,14 +67,7 @@ fn refine(
         return res;
     }
     match (signed, res) {
-        (Some(false), _) => Err(ApiError::Auth(auth::rejected_message())),
-        (Some(true), Err(e)) => {
-            log::warn!("library page did not parse while signed in: {e}");
-            let short: String = e.to_string().chars().take(80).collect();
-            Err(ApiError::Other(format!(
-                "YouTube changed this page, cmusic needs an update ({short})"
-            )))
-        }
+        (Some(false), _) => Err(ApiError::Auth(auth::EXPIRED.into())),
         (_, res) => res,
     }
 }
@@ -264,12 +263,18 @@ async fn connect() -> Yt {
         }
         match YtMusic::new_unauthenticated().await {
             Ok(yt) => Yt::Anon(yt),
-            Err(e) => Yt::Down(format!("cannot reach YouTube Music: {e}")),
+            Err(e) => {
+                log::warn!("cannot reach YouTube Music: {e}");
+                Yt::Down(OFFLINE.into())
+            }
         }
     };
     tokio::time::timeout(TIMEOUT, connect)
         .await
-        .unwrap_or_else(|_| Yt::Down("cannot reach YouTube Music: timed out".into()))
+        .unwrap_or_else(|_| {
+            log::warn!("cannot reach YouTube Music: timed out");
+            Yt::Down(OFFLINE.into())
+        })
 }
 
 /// Pages that work without an account.
@@ -282,7 +287,19 @@ async fn public<A: AuthToken>(yt: &YtMusic<A>, req: &PageRequest) -> Result<Page
                 yt.search_artists(q.as_str()),
                 yt.search_playlists(q.as_str()),
             );
-            let mut items: Vec<Item> = songs?
+            // A page that does not parse (no results, an odd result kind) is a search with
+            // nothing usable in it, not an error; only a dead connection is.
+            let songs = match songs {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("search {q:?}: {e}");
+                    match classify(e) {
+                        (e, false) => return Err(e),
+                        _ => Vec::new(),
+                    }
+                }
+            };
+            let mut items: Vec<Item> = songs
                 .iter()
                 .filter_map(|s| {
                     track(
@@ -650,21 +667,17 @@ mod tests {
     #[test]
     fn suspicious_results_follow_the_login_check() {
         let empty = || Ok(Page::default());
-        let parse = || Err(ApiError::Other("Key /x not found in Api response.".into()));
+        let parse = || Err(ApiError::Other(CHANGED.into()));
         assert!(is_parse_fault(&parse().unwrap_err()));
         // Signed out: both an empty page and a parse fault become Auth.
         for res in [empty(), parse()] {
             assert!(
-                matches!(refine(res, true, Some(false)), Err(ApiError::Auth(m)) if m.contains("did not accept"))
+                matches!(refine(res, true, Some(false)), Err(ApiError::Auth(m)) if m == auth::EXPIRED)
             );
         }
         // Signed in: empty stays empty, a parse fault says the page changed.
         assert_eq!(refine(empty(), true, Some(true)), empty());
-        let e = refine(parse(), true, Some(true)).unwrap_err().to_string();
-        assert!(
-            e.starts_with("YouTube changed this page, cmusic needs an update ("),
-            "{e}"
-        );
+        assert_eq!(refine(parse(), true, Some(true)), parse());
         // Unknown, or not suspect: untouched.
         assert_eq!(refine(parse(), true, None), parse());
         assert_eq!(refine(empty(), false, Some(false)), empty());
