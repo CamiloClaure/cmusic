@@ -97,11 +97,12 @@ trait Backend {
     /// Player effects (everything except `Resolve`, `FetchRadio` and `Persist`). `Err` when
     /// mpv refused a `Load` or `AppendNext`.
     fn play(&self, fx: &Effect) -> Result<(), String>;
-    /// `patient`: see `resolve::resolve`.
+    /// `patient`, `video`: see `resolve::resolve`.
     fn resolve(
         &self,
         video_id: String,
         patient: bool,
+        video: bool,
     ) -> BoxFuture<'static, Result<Stream, String>>;
     fn radio(&self, video_id: String) -> BoxFuture<'static, Result<Vec<Track>, String>>;
     fn lyrics(&self, track: Track) -> BoxFuture<'static, Option<Lyrics>>;
@@ -139,6 +140,7 @@ impl Backend for Real {
             Effect::SeekExact(secs) => m.seek(*secs, true),
             Effect::SetVolume(v) => m.set_volume(*v),
             Effect::SetNormalize(on) => m.set_normalize(*on),
+            Effect::SetVideo(on) => m.set_video(*on),
             Effect::Stop => m.stop(),
             Effect::Resolve(_)
             | Effect::Forget(_)
@@ -163,10 +165,11 @@ impl Backend for Real {
         &self,
         video_id: String,
         patient: bool,
+        video: bool,
     ) -> BoxFuture<'static, Result<Stream, String>> {
         async move {
             let cookies = auth::logged_in().then(auth::cookie_path);
-            resolve::resolve(&video_id, cookies.as_deref(), patient).await
+            resolve::resolve(&video_id, cookies.as_deref(), patient, video).await
         }
         .boxed()
     }
@@ -244,6 +247,7 @@ fn from_mpv(e: MpvEvent) -> Event {
         MpvEvent::Buffering(b) => Event::Buffering(b),
         MpvEvent::Refused { append: true, .. } => Event::AppendFailed,
         MpvEvent::Refused { message, .. } => Event::EndFile(EndReason::Error(message)),
+        MpvEvent::VideoClosed => Event::Command(Command::SetVideo(false)),
     }
 }
 
@@ -294,6 +298,7 @@ fn spawn(
                     patient: Default::default(),
                     jobs: Default::default(),
                     warm: Default::default(),
+                    video: false,
                 };
                 engine.run(cmds, msgs).await;
             });
@@ -331,6 +336,8 @@ struct Engine {
     jobs: std::collections::HashMap<String, Job>,
     /// Ids to warm when a slot is free, in order.
     warm: std::collections::VecDeque<String>,
+    /// Resolve for video mode (follows `Effect::SetVideo`).
+    video: bool,
 }
 
 struct Job {
@@ -359,6 +366,7 @@ impl Engine {
                 shuffle: s.shuffle,
                 repeat: s.repeat,
                 normalize: s.normalize,
+                video: s.video,
             });
         }
         self.emit();
@@ -431,6 +439,11 @@ impl Engine {
 
     fn event(&mut self, e: Event) {
         match &e {
+            // Finished before a mode switch killed its job: useless now.
+            Event::Resolved { video_id, stream } if stream.video != self.video => {
+                log::debug!("resolve {video_id} dropped, other mode");
+                return;
+            }
             Event::Resolved { video_id, stream } => {
                 self.jobs.remove(video_id);
                 self.cache
@@ -488,7 +501,7 @@ impl Engine {
             }
         }
         let patient = self.patient.remove(&video_id);
-        let fut = self.backend.resolve(video_id.clone(), patient);
+        let fut = self.backend.resolve(video_id.clone(), patient, self.video);
         let tx = self.tx.clone();
         let id = video_id.clone();
         let task = tokio::spawn(async move {
@@ -547,6 +560,20 @@ impl Engine {
                     job.warm = false; // already running: its answer serves this request
                 } else {
                     self.start_job(video_id, false);
+                }
+            }
+            Effect::SetVideo(on) => {
+                if on != self.video {
+                    self.video = on;
+                    // Every cached or running resolve is for the other mode.
+                    self.cache = Default::default();
+                    self.patient.clear();
+                    for (_, j) in self.jobs.drain() {
+                        j.task.abort();
+                    }
+                }
+                if let Err(e) = self.backend.play(&Effect::SetVideo(on)) {
+                    log::warn!("{e}");
                 }
             }
             Effect::Forget(video_id) => {
@@ -768,10 +795,16 @@ mod tests {
             }
             Ok(())
         }
-        fn resolve(&self, id: String, patient: bool) -> BoxFuture<'static, Result<Stream, String>> {
+        fn resolve(
+            &self,
+            id: String,
+            patient: bool,
+            video: bool,
+        ) -> BoxFuture<'static, Result<Stream, String>> {
             self.log.lock().unwrap().push(format!(
-                "resolve {id}{}",
-                if patient { " patient" } else { "" }
+                "resolve {id}{}{}",
+                if patient { " patient" } else { "" },
+                if video { " video" } else { "" }
             ));
             let fail = id == self.fail;
             async move {
@@ -780,7 +813,8 @@ mod tests {
                 } else {
                     Ok(Stream {
                         url: id,
-                        headers: Vec::new(),
+                        video,
+                        ..Stream::default()
                     })
                 }
             }

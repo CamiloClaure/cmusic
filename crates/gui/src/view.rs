@@ -980,6 +980,14 @@ fn bar(s: &State) -> Element<'_, Message> {
                 .style(pill(l, snap.normalize)),
             "Even out loudness between tracks"
         ),
+        tipped(
+            l,
+            button(text("Video").size(sz(l, S)))
+                .on_press(Message::Video)
+                .padding([6, 10])
+                .style(pill(l, snap.video)),
+            "Play the music video in its own window (F fullscreen, close it for audio only)"
+        ),
         tog(
             icons::music(),
             "Lyrics",

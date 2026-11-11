@@ -9,10 +9,14 @@ use crate::queue::Queue;
 use crate::types::{Command, Repeat, Snapshot, Status, Track};
 
 /// A playable stream: the direct URL plus the HTTP headers mpv must send with it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Stream {
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// Separate audio URL when `url` is a video-only stream.
+    pub audio: Option<String>,
+    /// Resolved for video mode. A stream from the other mode is never played.
+    pub video: bool,
 }
 
 /// Why mpv finished a file (mpv `end-file` reason).
@@ -69,6 +73,7 @@ pub enum Event {
         shuffle: bool,
         repeat: Repeat,
         normalize: bool,
+        video: bool,
     },
 }
 
@@ -95,6 +100,8 @@ pub enum Effect {
     SetVolume(u8),
     /// Loudness normalization on or off.
     SetNormalize(bool),
+    /// Video (its own window) or audio only. The engine drops every stream of the other mode.
+    SetVideo(bool),
     /// Stop playback and empty mpv's playlist.
     Stop,
     /// Fetch radio tracks for this seed video id, answer with `RadioFetched`.
@@ -129,6 +136,7 @@ pub struct State {
     duration: f64,
     volume: u8,
     normalize: bool,
+    video: bool,
     last_error: Option<String>,
     /// Failures since the last successful `FileLoaded`.
     failures: u8,
@@ -153,6 +161,7 @@ impl State {
             duration: 0.0,
             volume: 100,
             normalize: false,
+            video: false,
             last_error: None,
             failures: 0,
             radio_pending: None,
@@ -189,6 +198,7 @@ impl State {
             shuffle: self.queue.shuffle(),
             repeat: self.queue.repeat(),
             normalize: self.normalize,
+            video: self.video,
             last_error: self.last_error.clone(),
         }
     }
@@ -335,6 +345,22 @@ impl State {
                 self.normalize = !self.normalize;
                 fx.push(Effect::SetNormalize(self.normalize));
                 fx.push(Effect::Persist);
+            }
+            Command::SetVideo(on) if on != self.video => {
+                self.video = on;
+                fx.push(Effect::SetVideo(on));
+                fx.push(Effect::Persist);
+                // Both mpv entries hold streams of the old mode: reload where it was.
+                if self.loaded() || self.status == Status::Loading {
+                    if self.loaded() && self.position > 0.0 {
+                        self.resume_at.get_or_insert(self.position);
+                    }
+                    if matches!(self.next, Next::Appended(_)) {
+                        fx.push(Effect::ClearNext);
+                    }
+                    self.next = Next::Empty;
+                    self.start(fx);
+                }
             }
             _ => {}
         }
@@ -612,6 +638,7 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
             // The new mpv is empty, unpaused, at default volume.
             fx.push(Effect::SetVolume(st.volume));
             fx.push(Effect::SetNormalize(st.normalize));
+            fx.push(Effect::SetVideo(st.video));
             if st.paused {
                 fx.push(Effect::SetPause(true));
             }
@@ -631,6 +658,7 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
             shuffle,
             repeat,
             normalize,
+            video,
         } => {
             st.go_idle(&mut fx);
             st.queue.restore(queue, cursor, shuffle, repeat, &original);
@@ -638,11 +666,13 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
             st.resume_at = (st.position > 0.0).then_some(st.position);
             st.volume = volume.min(100);
             st.normalize = normalize;
+            st.video = video;
             st.radio_pending = None;
             st.failures = 0;
             st.last_error = None;
             fx.push(Effect::SetVolume(st.volume));
             fx.push(Effect::SetNormalize(normalize));
+            fx.push(Effect::SetVideo(video));
         }
         _ => {}
     }
@@ -678,7 +708,7 @@ mod tests {
     fn stream(id: &str) -> Stream {
         Stream {
             url: format!("https://media/{id}"),
-            headers: Vec::new(),
+            ..Stream::default()
         }
     }
 
@@ -1129,9 +1159,17 @@ mod tests {
                 shuffle: false,
                 repeat: Repeat::All,
                 normalize: true,
+                video: true,
             }],
         );
-        assert_eq!(fx, [Effect::SetVolume(100), Effect::SetNormalize(true)]);
+        assert_eq!(
+            fx,
+            [
+                Effect::SetVolume(100),
+                Effect::SetNormalize(true),
+                Effect::SetVideo(true)
+            ]
+        );
         let snap = st.snapshot();
         assert_eq!(
             (snap.status, snap.cursor, snap.position_secs),
@@ -1169,6 +1207,22 @@ mod tests {
     }
 
     #[test]
+    fn video_switch_reloads_the_current_track_where_it_was() {
+        let mut st = playing("a b c", 0);
+        feed(&mut st, vec![resolved("b"), Event::TimePos(42.0)]);
+        let fx = reduce(&mut st, cmd(Command::SetVideo(true)));
+        assert_eq!(fx[0], Effect::SetVideo(true));
+        assert!(fx.contains(&ClearNext) && fx.contains(&Stop), "{fx:?}");
+        assert!(fx.contains(&r("a")) && fx.contains(&r("b")), "{fx:?}");
+        assert!(st.snapshot().video);
+        assert_eq!(st.snapshot().position_secs, 42.0);
+        let fx = feed(&mut st, vec![resolved("a"), Event::FileLoaded]);
+        assert!(fx.contains(&SeekExact(42.0)), "{fx:?}");
+        // Already in that mode: nothing to do.
+        assert!(reduce(&mut st, cmd(Command::SetVideo(true))).is_empty());
+    }
+
+    #[test]
     fn restored_position_survives_resolving_but_not_a_failure() {
         let mut st = State::new(1);
         feed(
@@ -1182,6 +1236,7 @@ mod tests {
                 shuffle: false,
                 repeat: Repeat::Off,
                 normalize: false,
+                video: false,
             }],
         );
         feed(&mut st, vec![cmd(Command::TogglePause)]);

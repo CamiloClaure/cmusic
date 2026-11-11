@@ -19,6 +19,7 @@ pub struct Saved {
     pub shuffle: bool,
     pub repeat: Repeat,
     pub normalize: bool,
+    pub video: bool,
 }
 
 impl From<&Snapshot> for Saved {
@@ -32,6 +33,7 @@ impl From<&Snapshot> for Saved {
             shuffle: s.shuffle,
             repeat: s.repeat,
             normalize: s.normalize,
+            video: s.video,
         }
     }
 }
@@ -125,6 +127,7 @@ mod tests {
             shuffle: true,
             repeat: Repeat::All,
             normalize: true,
+            video: true,
         };
         save_to(&path, &s).unwrap();
         assert_eq!(load_from(&path), Some(s));

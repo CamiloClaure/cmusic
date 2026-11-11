@@ -16,6 +16,7 @@ d  remove from queue   C  clear queue
 Space  pause    >/<  next/prev
 ./,  seek +5/-5 s   Shift-Right/Left  +30/-30 s
 =/_  volume +5/-5   s  shuffle   r  repeat   N  normalize
+V  video in its own window (or audio only)
 ?  this help   q or Ctrl-C  quit";
 
 fn mmss(secs: f64) -> String {
@@ -224,10 +225,11 @@ fn draw_status(app: &App, f: &mut Frame, area: Rect) {
         s.last_error.as_deref().unwrap_or("")
     };
     let flags = format!(
-        "{name}  vol {}  shuffle {}  repeat {repeat}  norm {}",
+        "{name}  vol {}  shuffle {}  repeat {repeat}  norm {}  video {}",
         s.volume,
         onoff(s.shuffle),
-        onoff(s.normalize)
+        onoff(s.normalize),
+        onoff(s.video)
     );
     let [left, right] = Layout::horizontal([
         Constraint::Length(flags.chars().count() as u16),

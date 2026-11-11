@@ -2,7 +2,7 @@
 //! `cargo run --release -p cmusic-core --example play -- <step> <step> ...`
 //!
 //! Steps: `play:<id>[,<id>...]` `search:<query>` `warm:<id>[,<id>...]` `wait:<secs>` `ttfa` `seek:<secs>` `pause` `resume`
-//! `toggle` `next` `prev` `volume:<0-100>` `remove:<index>` `shuffle` `repeat` `logout`
+//! `toggle` `next` `prev` `volume:<0-100>` `remove:<index>` `shuffle` `repeat` `video:<on|off>` `logout`
 //! `fetch:<liked|playlists|songs|albums|artists>` `quit`.
 //! Legacy form `play -- <id> [secs]` still works. Every update is printed with elapsed seconds;
 //! `TTFA <ms> <id>` is the time from a play/next/prev to the first Playing snapshot with
@@ -231,6 +231,7 @@ impl Script {
             )),
             "shuffle" => self.h.send(Command::ToggleShuffle),
             "repeat" => self.h.send(Command::CycleRepeat),
+            "video" => self.h.send(Command::SetVideo(arg == "on")),
             "logout" => self.h.send(Command::Logout),
             "quit" => return Ok(false),
             _ => return Err(format!("unknown step {step:?}")),

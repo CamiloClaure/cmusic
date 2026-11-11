@@ -109,6 +109,7 @@ pub enum Message {
     Shuffle,
     Repeat,
     Normalize,
+    Video,
     ToggleLyrics,
     ToggleQueue,
     FocusSearch,
@@ -376,6 +377,7 @@ impl State {
             Message::Shuffle => out.commands.push(Command::ToggleShuffle),
             Message::Repeat => out.commands.push(Command::CycleRepeat),
             Message::Normalize => out.commands.push(Command::ToggleNormalize),
+            Message::Video => out.commands.push(Command::SetVideo(!self.snapshot.video)),
             Message::ToggleLyrics => {
                 self.show_lyrics = !self.show_lyrics;
                 self.lyric_line = None;

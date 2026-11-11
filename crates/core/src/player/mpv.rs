@@ -23,6 +23,8 @@ pub enum MpvEvent {
         append: bool,
         message: String,
     },
+    /// The user closed the video window.
+    VideoClosed,
 }
 
 /// Work for the command thread; runs in submission order.
@@ -58,6 +60,7 @@ impl MpvPlayer {
                 ("idle", "yes"),
                 ("input-default-bindings", "no"),
                 ("audio-client-name", "cmusic"),
+                ("title", "cmusic"),
                 ("network-timeout", "10"),
                 // Audio seeks land on the nearest cue point: no decoding up to the exact frame.
                 ("hr-seek", "no"),
@@ -74,6 +77,19 @@ impl MpvPlayer {
             Ok(())
         })
         .map_err(|e| format!("mpv init failed: {e}"))?;
+        // The video window gets a few keys of its own (default bindings are off). Closing it
+        // switches back to audio instead of quitting mpv.
+        for (key, cmd) in [
+            ("CLOSE_WIN", "script-message cmusic-video-closed"),
+            ("SPACE", "cycle pause"),
+            ("f", "cycle fullscreen"),
+            ("MBTN_LEFT_DBL", "cycle fullscreen"),
+            ("ESC", "set fullscreen no"),
+        ] {
+            if let Err(e) = mpv.command("keybind", &[key, cmd]) {
+                log::warn!("mpv keybind {key}: {e}");
+            }
+        }
 
         // A separate client has its own event queue, so this thread can block in
         // wait_event while other threads send commands through `mpv` (Mpv is Sync).
@@ -165,6 +181,9 @@ impl MpvPlayer {
                             };
                             log::log!(target: "mpv", lvl, "[{prefix}] {}", text.trim_end());
                             continue;
+                        }
+                        Event::ClientMessage(m) if m.first() == Some(&"cmusic-video-closed") => {
+                            MpvEvent::VideoClosed
                         }
                         Event::Shutdown => break,
                         _ => continue,
@@ -276,6 +295,11 @@ impl MpvPlayer {
         self.prop("af", if on { "loudnorm" } else { "" });
     }
 
+    /// Show video in mpv's own window, or play audio only. Takes effect from the next load.
+    pub fn set_video(&self, on: bool) {
+        self.prop("options/vid", if on { "auto" } else { "no" });
+    }
+
     pub fn stop(&self) {
         self.cmd("stop", &[]);
     }
@@ -307,7 +331,7 @@ impl MpvPlayer {
     }
 
     fn loadfile(&self, s: &Stream, append: bool) {
-        let (url, opts) = (s.url.clone(), file_options(&s.headers));
+        let (url, opts) = (s.url.clone(), file_options(s));
         let cb = self.on_event.clone();
         let mode = if append { "append" } else { "replace" };
         self.send(move |m| {
@@ -337,11 +361,15 @@ impl Drop for MpvPlayer {
 /// Per-file option list for `loadfile`. Values use mpv's `%len%value` form so
 /// commas and `=` inside them are not split; inside the header list itself a
 /// comma separates entries, so commas within a header value are escaped.
-fn file_options(headers: &[(String, String)]) -> String {
+fn file_options(s: &Stream) -> String {
     let quote = |v: &str| format!("%{}%{v}", v.len());
     let mut opts = Vec::new();
     let mut fields = Vec::new();
-    for (k, v) in headers {
+    // `audio-file` appends one entry: `audio-files` would split the URL at ':' or ';'.
+    if let Some(a) = &s.audio {
+        opts.push(format!("audio-file={}", quote(a)));
+    }
+    for (k, v) in &s.headers {
         if k.eq_ignore_ascii_case("user-agent") {
             opts.push(format!("user-agent={}", quote(v)));
         } else {
@@ -400,20 +428,25 @@ mod tests {
 
     #[test]
     fn options_escape() {
-        let h = vec![
-            ("User-Agent".into(), "a,b=c".into()),
-            ("Accept".into(), "x,y".into()),
-        ];
+        let mut s = Stream {
+            headers: vec![
+                ("User-Agent".into(), "a,b=c".into()),
+                ("Accept".into(), "x,y".into()),
+            ],
+            ..Stream::default()
+        };
         assert_eq!(
-            file_options(&h),
+            file_options(&s),
             "user-agent=%5%a,b=c,http-header-fields=%12%Accept: x\\,y"
         );
+        s.audio = Some("https://a/x?b=1,2".into());
+        assert!(file_options(&s).starts_with("audio-file=%17%https://a/x?b=1,2,user-agent="));
     }
 
     #[tokio::test]
     #[ignore = "needs network, yt-dlp and libmpv"]
     async fn plays_real_stream() {
-        let s = resolve("dQw4w9WgXcQ", None, false).await.unwrap();
+        let s = resolve("dQw4w9WgXcQ", None, false, false).await.unwrap();
         let (p, rx) = player();
         p.load(&s);
         let evs = collect(&rx, 30, |v| {
@@ -435,7 +468,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs network, yt-dlp and libmpv"]
     async fn gapless_transition() {
-        let s = resolve("dQw4w9WgXcQ", None, false).await.unwrap();
+        let s = resolve("dQw4w9WgXcQ", None, false, false).await.unwrap();
         let (p, rx) = player();
         p.load(&s);
         p.append_next(&s);
@@ -485,7 +518,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs network, yt-dlp and libmpv"]
     async fn load_replaces_playing_file_as_stopped() {
-        let s = resolve("dQw4w9WgXcQ", None, false).await.unwrap();
+        let s = resolve("dQw4w9WgXcQ", None, false, false).await.unwrap();
         let (p, rx) = player();
         p.load(&s);
         collect(&rx, 30, |v| v.contains(&MpvEvent::FileLoaded));
@@ -505,7 +538,7 @@ mod tests {
         let (p, rx) = player();
         p.load(&Stream {
             url: "https://127.0.0.1:9/nope".into(),
-            headers: vec![],
+            ..Stream::default()
         });
         let evs = collect(&rx, 20, |v| {
             v.iter().any(|e| matches!(e, MpvEvent::EndFile(_)))

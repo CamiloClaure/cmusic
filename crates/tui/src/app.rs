@@ -136,6 +136,7 @@ impl App {
             KeyCode::Char('s') => return vec![Command::ToggleShuffle],
             KeyCode::Char('r') => return vec![Command::CycleRepeat],
             KeyCode::Char('N') => return vec![Command::ToggleNormalize],
+            KeyCode::Char('V') => return vec![Command::SetVideo(!self.snap.video)],
             _ => return self.on_pane_key(key.code),
         }
         vec![]

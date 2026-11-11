@@ -17,13 +17,21 @@ const FAST_ARGS: [&str; 2] = [
     "youtube:player_client=visionos;skip=hls,dash",
 ];
 
+/// Audio only, or video up to 1080p plus the best audio. AV1 last: software decoding it is
+/// heavy on older machines.
+const AUDIO: &str = "bestaudio/best";
+const VIDEO: &str =
+    "bestvideo[height<=1080][vcodec!^=av01]+bestaudio/bestvideo[height<=1080]+bestaudio/best";
+
 /// Resolves `video_id`. The fast client first, then the full extraction. `patient` skips the
 /// fast path and holds the URL back until its `available_at` time (YouTube answers 403 before
-/// it): only for a retry after mpv refused a URL that was handed over at once.
+/// it): only for a retry after mpv refused a URL that was handed over at once. `video`: a
+/// video stream plus a separate audio one instead of audio only.
 pub async fn resolve(
     video_id: &str,
     cookies: Option<&Path>,
     patient: bool,
+    video: bool,
 ) -> Result<Stream, String> {
     if video_id.is_empty()
         || !video_id
@@ -36,7 +44,7 @@ pub async fn resolve(
     let jar = cookies.map(Jar::copy_of).transpose()?;
     let jar = jar.as_ref().map(|j| j.0.as_path());
     if !patient {
-        match run(video_id, jar, &FAST_ARGS, Duration::from_secs(12)).await {
+        match run(video_id, jar, video, &FAST_ARGS, Duration::from_secs(12)).await {
             Ok((stream, available_at)) => {
                 // Normally already past; once in ~50 a URL was refused (403) when used the
                 // instant yt-dlp returned. Never more than 2 s.
@@ -46,7 +54,7 @@ pub async fn resolve(
             Err(e) => log::debug!("fast resolve {video_id} failed, full extraction: {e}"),
         }
     }
-    let (stream, available_at) = run(video_id, jar, &[], Duration::from_secs(30)).await?;
+    let (stream, available_at) = run(video_id, jar, video, &[], Duration::from_secs(30)).await?;
     if patient {
         hold_until(video_id, available_at, 15.0).await;
     }
@@ -68,18 +76,14 @@ async fn hold_until(video_id: &str, available_at: f64, max: f64) {
 async fn run(
     video_id: &str,
     jar: Option<&Path>,
+    video: bool,
     extra: &[&str],
     limit: Duration,
 ) -> Result<(Stream, f64), String> {
     let kind = if extra.is_empty() { "full" } else { "fast" };
     let mut cmd = Command::new("yt-dlp");
-    cmd.args([
-        "-j",
-        "-f",
-        "bestaudio/best",
-        "--no-playlist",
-        "--no-warnings",
-    ]);
+    let format = if video { VIDEO } else { AUDIO };
+    cmd.args(["-j", "-f", format, "--no-playlist", "--no-warnings"]);
     cmd.args(extra);
     if let Some(c) = jar {
         cmd.arg("--cookies").arg(c);
@@ -109,7 +113,9 @@ async fn run(
         log::debug!("yt-dlp {video_id} {kind} failed: {line}");
         return Err(friendly(line));
     }
-    parse(&out.stdout)
+    let (mut stream, at) = parse(&out.stdout)?;
+    stream.video = video;
+    Ok((stream, at))
 }
 
 /// A yt-dlp error line as one short sentence for the user. The raw line goes to the log.
@@ -128,7 +134,10 @@ fn friendly(raw: &str) -> String {
     let low = line.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| low.contains(w));
     // Order matters: "live stream recording is not available" also says "not available".
-    let short = if has(&["live stream", "live event", "premieres in", "will begin in"]) {
+    let short = if has(&["requested format"]) {
+        // Logged in, yt-dlp uses clients whose streams need a JS runtime to unlock.
+        "No playable stream, install deno (yt-dlp needs it) or update yt-dlp"
+    } else if has(&["live stream", "live event", "premieres in", "will begin in"]) {
         "Live streams cannot be played"
     } else if has(&["private video"]) {
         "This video is private"
@@ -247,20 +256,40 @@ impl Cache {
     }
 }
 
-/// Returns the stream and its `available_at` unix time (0 when absent).
+/// Returns the stream and its `available_at` unix time (0 when absent). A `video+audio`
+/// format has no top-level url, only `requested_formats`: video first, then audio.
 fn parse(json: &[u8]) -> Result<(Stream, f64), String> {
     #[derive(serde::Deserialize)]
     struct Raw {
         url: Option<String>,
         http_headers: Option<std::collections::BTreeMap<String, String>>,
         available_at: Option<f64>,
+        #[serde(default)]
+        requested_formats: Vec<Raw>,
     }
     let raw: Raw = serde_json::from_slice(json).map_err(|e| format!("bad yt-dlp output: {e}"))?;
-    let stream = Stream {
-        url: raw.url.ok_or("yt-dlp output has no url")?,
-        headers: raw.http_headers.unwrap_or_default().into_iter().collect(),
+    let (main, audio, at) = match raw.requested_formats.as_slice() {
+        [v, a] => {
+            let at = v
+                .available_at
+                .unwrap_or(0.0)
+                .max(a.available_at.unwrap_or(0.0));
+            (v, a.url.clone(), at)
+        }
+        _ => (&raw, None, raw.available_at.unwrap_or(0.0)),
     };
-    Ok((stream, raw.available_at.unwrap_or(0.0)))
+    let stream = Stream {
+        url: main.url.clone().ok_or("yt-dlp output has no url")?,
+        headers: main
+            .http_headers
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        audio,
+        video: false,
+    };
+    Ok((stream, at))
 }
 
 #[cfg(test)]
@@ -283,6 +312,7 @@ mod tests {
             ("ERROR: [youtube] x: This video is only available to Music Premium members", "Only for YouTube Music Premium"),
             ("ERROR: [youtube] x: The uploader has not made this video available in your country", "Not available in your region"),
             ("ERROR: [youtube] x: Unable to download webpage: <urlopen error timed out>", "Network problem, check your connection"),
+            ("ERROR: [youtube] fJ9rUzIMcZQ: Requested format is not available. Use --list-formats for a list of available formats", "No playable stream, install deno (yt-dlp needs it) or update yt-dlp"),
             // Unknown: only the prefixes go.
             ("ERROR: [youtube] abc: Something new happened", "Something new happened"),
             ("yt-dlp failed", "yt-dlp failed"),
@@ -306,16 +336,31 @@ mod tests {
         assert!(parse(b"nope").is_err());
     }
 
+    #[test]
+    fn video_and_audio_come_from_requested_formats() {
+        let json = br#"{"requested_formats":[
+            {"url":"https://v","http_headers":{"User-Agent":"ua"},"available_at":5},
+            {"url":"https://a","available_at":7}]}"#;
+        let (s, at) = parse(json).unwrap();
+        assert_eq!(
+            (s.url.as_str(), s.audio.as_deref(), at),
+            ("https://v", Some("https://a"), 7.0)
+        );
+        assert_eq!(s.headers, [("User-Agent".to_string(), "ua".to_string())]);
+        let (s, _) = parse(br#"{"url":"https://x","requested_formats":[]}"#).unwrap();
+        assert_eq!((s.url.as_str(), s.audio), ("https://x", None));
+    }
+
     #[tokio::test]
     async fn rejects_bad_id() {
-        assert!(resolve("", None, false).await.is_err());
-        assert!(resolve("a b;rm", None, false).await.is_err());
+        assert!(resolve("", None, false, false).await.is_err());
+        assert!(resolve("a b;rm", None, false, false).await.is_err());
     }
 
     #[tokio::test]
     #[ignore = "needs network and yt-dlp"]
     async fn resolves_real_video() {
-        let s = resolve("dQw4w9WgXcQ", None, false).await.unwrap();
+        let s = resolve("dQw4w9WgXcQ", None, false, false).await.unwrap();
         assert!(s.url.starts_with("https://"), "{}", s.url);
         assert!(!s.headers.is_empty());
     }
@@ -323,7 +368,7 @@ mod tests {
     fn stream(url: &str) -> Stream {
         Stream {
             url: url.into(),
-            headers: Vec::new(),
+            ..Stream::default()
         }
     }
 

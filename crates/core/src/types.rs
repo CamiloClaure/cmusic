@@ -48,6 +48,8 @@ pub struct Snapshot {
     pub shuffle: bool,
     pub repeat: Repeat,
     pub normalize: bool,
+    /// Video in its own window instead of audio only.
+    pub video: bool,
     /// Last playback failure, shown to the user. Cleared when a track starts playing; a skipped
     /// track also arrives as an `Update::Notice` that outlives it.
     pub last_error: Option<String>,
@@ -147,6 +149,8 @@ pub enum Command {
     ToggleShuffle,
     CycleRepeat,
     ToggleNormalize,
+    /// Play video (in mpv's own window) or audio only. Reloads the current track in place.
+    SetVideo(bool),
     // Browsing. Results arrive as `Update::Page` / `Update::Notice`.
     Fetch(PageRequest),
     Rate {
