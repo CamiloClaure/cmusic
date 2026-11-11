@@ -411,7 +411,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs network, yt-dlp and libmpv"]
     async fn plays_real_stream() {
-        let s = resolve("dQw4w9WgXcQ", None).await.unwrap();
+        let s = resolve("dQw4w9WgXcQ", None, false).await.unwrap();
         let (p, rx) = player();
         p.load(&s);
         let evs = collect(&rx, 30, |v| {
@@ -433,7 +433,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs network, yt-dlp and libmpv"]
     async fn gapless_transition() {
-        let s = resolve("dQw4w9WgXcQ", None).await.unwrap();
+        let s = resolve("dQw4w9WgXcQ", None, false).await.unwrap();
         let (p, rx) = player();
         p.load(&s);
         p.append_next(&s);
@@ -483,7 +483,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs network, yt-dlp and libmpv"]
     async fn load_replaces_playing_file_as_stopped() {
-        let s = resolve("dQw4w9WgXcQ", None).await.unwrap();
+        let s = resolve("dQw4w9WgXcQ", None, false).await.unwrap();
         let (p, rx) = player();
         p.load(&s);
         collect(&rx, 30, |v| v.contains(&MpvEvent::FileLoaded));

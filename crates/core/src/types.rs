@@ -160,6 +160,9 @@ pub enum Command {
         playlist_id: String,
         video_id: String,
     },
+    /// Resolve these video ids ahead of time (the first few rows of a page) so playing one is
+    /// instant. Best effort, replaces the previous list, never shown to the user.
+    Warm(Vec<String>),
     // Login. Success arrives as `Update::Notice`, failure as `Update::AuthRequired`.
     ImportCookies(CookieSource),
     /// Save state and stop the engine.

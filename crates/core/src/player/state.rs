@@ -79,6 +79,8 @@ pub enum Effect {
     Load(Stream),
     /// Append to mpv's playlist as the gapless next entry.
     AppendNext(Stream),
+    /// Drop the cached stream of this video id: mpv refused it, the retry must resolve afresh.
+    Forget(String),
     /// Remove the appended next entry (everything after mpv's current one).
     ClearNext,
     /// Set mpv's `pause` property.
@@ -126,8 +128,10 @@ pub struct State {
     failures: u8,
     /// Seed of the radio fetch in flight.
     radio_pending: Option<String>,
-    /// Restored position, applied on the next `FileLoaded`.
+    /// Restored or user-requested position, applied on the next `FileLoaded`.
     resume_at: Option<f64>,
+    /// The current track was already retried once after mpv refused its stream.
+    retried: bool,
 }
 
 impl State {
@@ -147,7 +151,18 @@ impl State {
             failures: 0,
             radio_pending: None,
             resume_at: None,
+            retried: false,
         }
+    }
+
+    /// Video ids whose stream the player wants resolved now: the current track and mpv's next.
+    pub fn wanted(&self) -> Vec<String> {
+        let cur = self.queue.current().map(|t| t.video_id.clone());
+        let next = match &self.next {
+            Next::Resolving(id) | Next::Appended(id) => Some(id.clone()),
+            Next::Empty => None,
+        };
+        cur.into_iter().chain(next).collect()
     }
 
     /// What the front ends draw.
@@ -271,7 +286,9 @@ impl State {
                 }
             }
             Command::SeekTo(secs) => self.seek(secs, fx),
-            Command::SeekBy(delta) => self.seek(self.position + delta, fx),
+            Command::SeekBy(delta) => {
+                self.seek(self.resume_at.unwrap_or(self.position) + delta, fx)
+            }
             Command::SetVolume(volume) => {
                 self.volume = volume.min(100);
                 fx.push(Effect::SetVolume(self.volume));
@@ -303,6 +320,7 @@ impl State {
     /// A user-picked track change: fresh failure count, forget the restored position.
     fn change_track(&mut self, fx: &mut Vec<Effect>) {
         self.failures = 0;
+        self.retried = false;
         self.resume_at = None;
         fx.push(Effect::Persist);
         self.start(fx);
@@ -347,6 +365,11 @@ impl State {
     }
 
     fn seek(&mut self, secs: f64, fx: &mut Vec<Effect>) {
+        if self.status == Status::Loading {
+            // Applied by `FileLoaded`; shown meanwhile.
+            self.resume_at = Some(secs.max(0.0)); // max() also turns NaN into 0
+            return;
+        }
         if !self.loaded() {
             return;
         }
@@ -376,7 +399,9 @@ impl State {
             }
             self.next = Next::Empty;
         }
-        if let (true, Next::Empty, Some(id)) = (self.loaded(), &self.next, want) {
+        // Also while the current track loads: its answer may already be cached by then.
+        let ready = self.loaded() || self.status == Status::Loading;
+        if let (true, Next::Empty, Some(id)) = (ready, &self.next, want) {
             fx.push(Effect::Resolve(id.clone()));
             self.next = Next::Resolving(id);
         }
@@ -396,6 +421,7 @@ impl State {
     /// The current track failed: record it, skip forward, or stop after three in a row.
     fn fail(&mut self, message: String, fx: &mut Vec<Effect>) {
         self.failures = self.failures.saturating_add(1);
+        self.retried = false;
         self.last_error = Some(message);
         self.resume_at = None;
         if self.failures >= 3 {
@@ -423,8 +449,14 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
                 st.load_sent = true;
                 fx.push(Effect::Load(stream));
             } else if matches!(&st.next, Next::Resolving(id) if *id == video_id) {
-                st.next = Next::Appended(video_id);
-                fx.push(Effect::AppendNext(stream));
+                if st.loaded() {
+                    st.next = Next::Appended(video_id);
+                    fx.push(Effect::AppendNext(stream));
+                } else {
+                    // The `Load` of the current track would wipe the append. The engine caches
+                    // the stream, so asking again after `FileLoaded` is instant.
+                    st.next = Next::Empty;
+                }
             }
         }
         Event::ResolveFailed { video_id, message } => {
@@ -437,6 +469,7 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
         Event::FileLoaded if st.status == Status::Loading && st.load_sent => {
             st.status = st.play_status();
             st.failures = 0;
+            st.retried = false;
             st.last_error = None;
             if let Some(secs) = st.resume_at.take() {
                 st.seek(secs, &mut fx);
@@ -470,7 +503,15 @@ pub fn reduce(st: &mut State, event: Event) -> Vec<Effect> {
         Event::EndFile(EndReason::Error(message)) if st.load_sent => {
             // With an appended entry mpv moves on by itself, so `start` must `Stop` it.
             st.load_sent = matches!(st.next, Next::Appended(_));
-            st.fail(message, &mut fx);
+            match st.queue.current().map(|t| t.video_id.clone()) {
+                // Refused before it ever played: the stream may be stale or too early.
+                Some(id) if st.status == Status::Loading && !st.retried => {
+                    st.retried = true;
+                    fx.push(Effect::Forget(id));
+                    st.start(&mut fx);
+                }
+                _ => st.fail(message, &mut fx),
+            }
         }
         Event::EndFile(EndReason::NoAudio) if st.load_sent => {
             fx.push(Effect::Stop);
@@ -654,52 +695,58 @@ mod tests {
         #[rustfmt::skip]
         let cases = vec![
             ("play starts loading", State::new(1), vec![play(ABCDE, 0)],
-                vec![r("a"), Persist], Loading, Some(0)),
+                vec![r("a"), r("b"), Persist], Loading, Some(0)),
             ("loaded track resolves the next one", State::new(1),
                 vec![play(ABCDE, 0), resolved("a"), FileLoaded],
-                vec![r("a"), Persist, load("a"), r("b")], Playing, Some(0)),
+                vec![r("a"), r("b"), Persist, load("a")], Playing, Some(0)),
             ("eof advances, reusing the in-flight resolve", playing(ABCDE, 0),
                 vec![eof(), resolved("b"), FileLoaded],
-                vec![Stop, Persist, load("b"), r("c")], Playing, Some(1)),
+                vec![Stop, r("c"), Persist, load("b")], Playing, Some(1)),
             ("gapless advance with appended next", playing(ABCDE, 0),
                 vec![resolved("b"), eof(), FileLoaded],
-                vec![AppendNext(stream("b")), Persist, r("c")], Playing, Some(1)),
+                vec![AppendNext(stream("b")), r("c"), Persist], Playing, Some(1)),
             ("eof racing a cleared next stops mpv's own advance", playing(ABCDE, 0),
                 vec![resolved("b"), cmd(Command::PlayNext(tracks("x"))), eof()],
-                vec![AppendNext(stream("b")), ClearNext, r("x"), Persist, Stop, Persist],
+                vec![AppendNext(stream("b")), ClearNext, r("x"), Persist, Stop, r("b"), Persist],
                 Loading, Some(1)),
             ("failed append falls back to a normal advance", playing(ABCDE, 0),
                 vec![resolved("b"), AppendFailed, eof()],
-                vec![AppendNext(stream("b")), Stop, r("b"), Persist], Loading, Some(1)),
+                vec![AppendNext(stream("b")), Stop, r("b"), r("c"), Persist], Loading, Some(1)),
             ("last tracks trigger autoplay fetch", State::new(1), vec![play("a b", 0)],
-                vec![r("a"), FetchRadio("a".into()), Persist], Loading, Some(0)),
+                vec![r("a"), r("b"), FetchRadio("a".into()), Persist], Loading, Some(0)),
             ("radio continues the queue", playing("a", 0),
                 vec![radio("a", "a x y z"), resolved("x"), eof(), FileLoaded],
-                vec![r("x"), Persist, AppendNext(stream("x")), FetchRadio("x".into()), Persist,
-                     r("y")], Playing, Some(1)),
+                vec![r("x"), Persist, AppendNext(stream("x")), r("y"), FetchRadio("x".into()),
+                     Persist], Playing, Some(1)),
             ("radio arriving after the end resumes", playing("a", 0),
                 vec![eof(), radio("a", "x")],
                 vec![Stop, r("x"), FetchRadio("x".into()), Persist], Loading, Some(1)),
             ("queue end without radio goes idle", playing("a", 0),
                 vec![radio("a", ""), eof()], vec![Stop], Idle, Some(0)),
             ("failed resolve skips", State::new(1), vec![play(ABCDE, 0), failed("a")],
-                vec![r("a"), Persist, r("b"), Persist], Loading, Some(1)),
-            ("load error skips", State::new(1),
+                vec![r("a"), r("b"), Persist, r("c"), Persist], Loading, Some(1)),
+            ("load error retries once with a fresh resolve", State::new(1),
                 vec![play(ABCDE, 0), resolved("a"), EndFile(EndReason::Error("403".into()))],
-                vec![r("a"), Persist, load("a"), r("b"), Persist], Loading, Some(1)),
+                vec![r("a"), r("b"), Persist, load("a"), Effect::Forget("a".into()), r("a"),
+                     r("b")], Loading, Some(0)),
+            ("load error twice skips", State::new(1),
+                vec![play(ABCDE, 0), resolved("a"), EndFile(EndReason::Error("403".into())),
+                     resolved("a"), EndFile(EndReason::Error("403".into()))],
+                vec![r("a"), r("b"), Persist, load("a"), Effect::Forget("a".into()), r("a"),
+                     r("b"), load("a"), r("c"), Persist], Loading, Some(1)),
             ("playback error with appended next stops mpv's own advance", playing(ABCDE, 0),
                 vec![resolved("b"), EndFile(EndReason::Error("net".into()))],
-                vec![AppendNext(stream("b")), Stop, r("b"), Persist], Loading, Some(1)),
+                vec![AppendNext(stream("b")), Stop, r("b"), r("c"), Persist], Loading, Some(1)),
             ("three failures stop in Error", State::new(1),
                 vec![play(ABCDE, 0), failed("a"), failed("b"), failed("c"), resolved("d"),
                      resolved("c"), FileLoaded],
-                vec![r("a"), Persist, r("b"), Persist, r("c"), FetchRadio("c".into()), Persist],
+                vec![r("a"), r("b"), Persist, r("c"), Persist, r("d"), FetchRadio("c".into()), Persist],
                 Error, Some(2)),
             ("FileLoaded resets the failure count", State::new(1),
                 vec![play(ABCDE, 0), failed("a"), failed("b"), resolved("c"), FileLoaded,
                      EndFile(EndReason::Error("x".into())), failed("d")],
-                vec![r("a"), Persist, r("b"), Persist, r("c"), FetchRadio("c".into()), Persist,
-                     load("c"), r("d"), Persist, r("e"), Persist], Loading, Some(4)),
+                vec![r("a"), r("b"), Persist, r("c"), Persist, r("d"), FetchRadio("c".into()), Persist,
+                     load("c"), r("e"), Persist, Persist], Loading, Some(4)),
             ("stopped end-file is ignored", playing(ABCDE, 0),
                 vec![EndFile(EndReason::Stopped)], vec![], Playing, Some(0)),
             ("pause and resume", playing(ABCDE, 0),
@@ -713,11 +760,11 @@ mod tests {
             ("repeat one replays gaplessly", playing(ABCDE, 0),
                 vec![cmd(Command::CycleRepeat), cmd(Command::CycleRepeat), resolved("a"), eof(),
                      FileLoaded],
-                vec![Persist, r("a"), Persist, AppendNext(stream("a")), Persist, r("a")],
+                vec![Persist, r("a"), Persist, AppendNext(stream("a")), r("a"), Persist],
                 Playing, Some(0)),
             ("repeat all wraps", State::new(1),
                 vec![cmd(Command::CycleRepeat), play(ABCDE, 4), resolved("e"), FileLoaded, eof()],
-                vec![Persist, r("e"), Persist, load("e"), r("a"), Stop, Persist], Loading, Some(0)),
+                vec![Persist, r("e"), r("a"), Persist, load("e"), Stop, r("b"), Persist], Loading, Some(0)),
             ("play-next replaces the appended next", playing(ABCDE, 0),
                 vec![resolved("b"), cmd(Command::PlayNext(tracks("x")))],
                 vec![AppendNext(stream("b")), ClearNext, r("x"), Persist], Playing, Some(0)),
@@ -731,7 +778,7 @@ mod tests {
                 vec![AppendNext(stream("d")), Persist], Playing, Some(1)),
             ("remove the current track starts the following one", playing(ABCDE, 1),
                 // "c" was already resolving as the next track, so no new Resolve.
-                vec![cmd(Command::RemoveFromQueue(1))], vec![Stop, FetchRadio("c".into()), Persist],
+                vec![cmd(Command::RemoveFromQueue(1))], vec![Stop, r("d"), FetchRadio("c".into()), Persist],
                 Loading, Some(1)),
             ("remove the last current track goes idle", playing("a", 0),
                 vec![cmd(Command::RemoveFromQueue(0))], vec![Stop, Persist], Idle, None),
@@ -739,7 +786,7 @@ mod tests {
                 vec![Event::TimePos(10.0), cmd(Command::Prev)], vec![Seek(0.0)], Playing, Some(2)),
             ("prev early goes back", playing(ABCDE, 2),
                 vec![Event::TimePos(1.0), cmd(Command::Prev)],
-                vec![Stop, r("b"), Persist], Loading, Some(1)),
+                vec![Stop, r("b"), r("c"), Persist], Loading, Some(1)),
             ("prev on the first track restarts it", playing(ABCDE, 0),
                 vec![cmd(Command::Prev)], vec![Seek(0.0)], Playing, Some(0)),
             ("clear stops", playing(ABCDE, 0), vec![cmd(Command::ClearQueue)],
@@ -750,6 +797,51 @@ mod tests {
             assert_eq!(got, want, "{name}");
             assert_eq!((st.status, st.queue.cursor()), (status, cursor), "{name}");
         }
+    }
+
+    #[test]
+    fn next_answer_before_the_current_loads_is_not_appended() {
+        let mut st = State::new(1);
+        let fx = feed(&mut st, vec![play("a b c d e", 0), resolved("b")]);
+        assert_eq!(
+            fx,
+            [r("a"), r("b"), Persist],
+            "no AppendNext yet: Load would wipe it"
+        );
+        let fx = feed(&mut st, vec![resolved("a"), Event::FileLoaded]);
+        // Asked again once loaded (the engine answers from its cache).
+        assert_eq!(fx, [load("a"), r("b")]);
+        assert_eq!(
+            feed(&mut st, vec![resolved("b")]),
+            [AppendNext(stream("b"))]
+        );
+        // A manual Next re-asks for the track; the engine cache makes it instant.
+        let fx = feed(&mut st, vec![cmd(Command::Next)]);
+        assert_eq!(fx[..2], [Stop, r("b")]);
+    }
+
+    #[test]
+    fn seek_while_loading_is_applied_when_loaded() {
+        let mut st = State::new(1);
+        feed(&mut st, vec![play("a b", 0), cmd(Command::SeekTo(30.0))]);
+        assert_eq!(st.snapshot().position_secs, 30.0, "shown while loading");
+        feed(&mut st, vec![cmd(Command::SeekBy(5.0))]);
+        feed(&mut st, vec![resolved("a")]);
+        let fx = feed(&mut st, vec![Event::FileLoaded]);
+        assert!(fx.contains(&Seek(35.0)), "{fx:?}");
+        assert_eq!(st.snapshot().position_secs, 35.0);
+        // A pick of another track drops it.
+        let mut st = State::new(1);
+        feed(
+            &mut st,
+            vec![
+                play("a b", 0),
+                cmd(Command::SeekTo(30.0)),
+                cmd(Command::Next),
+            ],
+        );
+        let fx = feed(&mut st, vec![resolved("b"), Event::FileLoaded]);
+        assert!(!fx.iter().any(|e| matches!(e, Seek(_))), "{fx:?}");
     }
 
     #[test]
@@ -802,8 +894,11 @@ mod tests {
             &mut st,
             vec![play(ABCDE, 0), failed("a"), failed("b"), failed("c")],
         );
-        assert_eq!(feed(&mut st, vec![cmd(Command::Next)]), [r("d"), Persist]);
-        assert_eq!(feed(&mut st, vec![failed("d")]), [r("e"), Persist]);
+        assert_eq!(
+            feed(&mut st, vec![cmd(Command::Next)]),
+            [r("d"), r("e"), Persist]
+        );
+        assert_eq!(feed(&mut st, vec![failed("d")]), [Persist]);
     }
 
     #[test]
@@ -855,7 +950,7 @@ mod tests {
             &mut st,
             vec![cmd(Command::TogglePause), resolved("b"), Event::FileLoaded],
         );
-        assert_eq!(fx, [r("b"), load("b"), Seek(42.0), r("c")]);
+        assert_eq!(fx, [r("b"), r("c"), load("b"), Seek(42.0)]);
     }
 
     #[test]

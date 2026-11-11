@@ -84,7 +84,12 @@ trait Backend {
     /// Player effects (everything except `Resolve`, `FetchRadio` and `Persist`). `Err` when
     /// mpv refused a `Load` or `AppendNext`.
     fn play(&self, fx: &Effect) -> Result<(), String>;
-    fn resolve(&self, video_id: String) -> BoxFuture<'static, Result<Stream, String>>;
+    /// `patient`: see `resolve::resolve`.
+    fn resolve(
+        &self,
+        video_id: String,
+        patient: bool,
+    ) -> BoxFuture<'static, Result<Stream, String>>;
     fn radio(&self, video_id: String) -> BoxFuture<'static, Result<Vec<Track>, String>>;
     fn lyrics(&self, track: Track) -> BoxFuture<'static, Option<Lyrics>>;
     /// A player command has been stuck for too long.
@@ -121,7 +126,7 @@ impl Backend for Real {
             Effect::SetVolume(v) => m.set_volume(*v),
             Effect::SetNormalize(on) => m.set_normalize(*on),
             Effect::Stop => m.stop(),
-            Effect::Resolve(_) | Effect::FetchRadio(_) | Effect::Persist => {}
+            Effect::Resolve(_) | Effect::Forget(_) | Effect::FetchRadio(_) | Effect::Persist => {}
         }
         Ok(())
     }
@@ -136,10 +141,14 @@ impl Backend for Real {
         Ok(())
     }
 
-    fn resolve(&self, video_id: String) -> BoxFuture<'static, Result<Stream, String>> {
+    fn resolve(
+        &self,
+        video_id: String,
+        patient: bool,
+    ) -> BoxFuture<'static, Result<Stream, String>> {
         async move {
             let cookies = auth::logged_in().then(auth::cookie_path);
-            resolve::resolve(&video_id, cookies.as_deref()).await
+            resolve::resolve(&video_id, cookies.as_deref(), patient).await
         }
         .boxed()
     }
@@ -263,6 +272,10 @@ fn spawn(
                     last_save: Instant::now(),
                     lyrics_for: None,
                     watchdog_off: false,
+                    cache: Default::default(),
+                    patient: Default::default(),
+                    jobs: Default::default(),
+                    warm: Default::default(),
                 };
                 engine.run(cmds, msgs).await;
             });
@@ -293,7 +306,25 @@ struct Engine {
     lyrics_for: Option<String>,
     /// A restart failed: stop trying.
     watchdog_off: bool,
+    cache: resolve::Cache,
+    /// Ids whose next resolve waits for `available_at` (their cached stream was refused).
+    patient: std::collections::HashSet<String>,
+    /// Running yt-dlp resolves.
+    jobs: std::collections::HashMap<String, Job>,
+    /// Ids to warm when a slot is free, in order.
+    warm: std::collections::VecDeque<String>,
 }
+
+struct Job {
+    /// Speculative: runs only in a free slot and is the first to be killed.
+    warm: bool,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Concurrent yt-dlp processes: the current track, the next one, nothing more.
+const MAX_JOBS: usize = 2;
+/// Rows of a fresh page worth warming.
+const WARM_MAX: usize = 3;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const SAVE_WHILE_PLAYING: Duration = Duration::from_secs(15);
@@ -359,18 +390,105 @@ impl Engine {
                     }
                 });
             }
-            c => self.event(Event::Command(c)),
+            Command::Warm(ids) => {
+                self.warm = ids.into_iter().take(WARM_MAX).collect();
+                self.pump();
+            }
+            c => {
+                if matches!(c, Command::PlayTracks { .. }) {
+                    self.warm.clear();
+                }
+                self.event(Event::Command(c))
+            }
         }
     }
 
     fn event(&mut self, e: Event) {
+        match &e {
+            Event::Resolved { video_id, stream } => {
+                self.jobs.remove(video_id);
+                self.cache
+                    .put(video_id, stream.clone(), resolve::unix_now());
+            }
+            Event::ResolveFailed { video_id, .. } => {
+                self.jobs.remove(video_id);
+            }
+            _ => {}
+        }
         let fx = reduce(&mut self.st, e);
+        // Kill resolves nobody waits for any more (rapid Next presses).
+        let wanted = self.st.wanted();
+        self.jobs.retain(|id, j| {
+            let keep = j.warm || wanted.contains(id);
+            if !keep {
+                j.task.abort(); // kill_on_drop ends yt-dlp
+            }
+            keep
+        });
         // Before the effects, so the UI follows the reducer even when an effect is slow.
         self.emit();
         for fx in fx {
             self.effect(fx);
         }
         self.emit();
+        self.pump();
+    }
+
+    /// Starts queued warm-ups while a slot is free.
+    fn pump(&mut self) {
+        while self.jobs.len() < MAX_JOBS {
+            let Some(id) = self.warm.pop_front() else {
+                break;
+            };
+            if !self.jobs.contains_key(&id) && self.cache.get(&id, resolve::unix_now()).is_none() {
+                self.start_job(id, true);
+            }
+        }
+    }
+
+    fn start_job(&mut self, video_id: String, warm: bool) {
+        // The user's track always gets a slot: the youngest warm-up makes room.
+        while !warm && self.jobs.len() >= MAX_JOBS {
+            let Some(id) = self
+                .jobs
+                .iter()
+                .find(|(_, j)| j.warm)
+                .map(|(id, _)| id.clone())
+            else {
+                break; // ponytail: user resolves are not capped; current + next never exceed 2
+            };
+            if let Some(j) = self.jobs.remove(&id) {
+                j.task.abort();
+            }
+        }
+        let patient = self.patient.remove(&video_id);
+        let fut = self.backend.resolve(video_id.clone(), patient);
+        let tx = self.tx.clone();
+        let id = video_id.clone();
+        let task = tokio::spawn(async move {
+            let video_id = id;
+            let t = std::time::Instant::now();
+            log::debug!("resolve start {video_id}");
+            let ev = match fut.await {
+                Ok(stream) => {
+                    log::debug!(
+                        "resolve end {video_id} ok {}ms {}",
+                        t.elapsed().as_millis(),
+                        url_info(&stream.url)
+                    );
+                    Event::Resolved { video_id, stream }
+                }
+                Err(message) => {
+                    log::debug!(
+                        "resolve end {video_id} err {}ms: {message}",
+                        t.elapsed().as_millis()
+                    );
+                    Event::ResolveFailed { video_id, message }
+                }
+            };
+            let _ = tx.send(Msg::Ev(ev));
+        });
+        self.jobs.insert(video_id, Job { warm, task });
     }
 
     /// mpv stuck on a command: replace it and reload the current track where it was.
@@ -396,29 +514,18 @@ impl Engine {
         log::debug!("effect {}", head(&fx));
         match fx {
             Effect::Resolve(video_id) => {
-                let fut = self.backend.resolve(video_id.clone());
-                tokio::spawn(async move {
-                    let t = std::time::Instant::now();
-                    log::debug!("resolve start {video_id}");
-                    let ev = match fut.await {
-                        Ok(stream) => {
-                            log::debug!(
-                                "resolve end {video_id} ok {}ms {}",
-                                t.elapsed().as_millis(),
-                                url_info(&stream.url)
-                            );
-                            Event::Resolved { video_id, stream }
-                        }
-                        Err(message) => {
-                            log::debug!(
-                                "resolve end {video_id} err {}ms: {message}",
-                                t.elapsed().as_millis()
-                            );
-                            Event::ResolveFailed { video_id, message }
-                        }
-                    };
-                    let _ = tx.send(Msg::Ev(ev));
-                });
+                if let Some(stream) = self.cache.get(&video_id, resolve::unix_now()) {
+                    log::debug!("resolve cache hit {video_id} {}", url_info(&stream.url));
+                    let _ = tx.send(Msg::Ev(Event::Resolved { video_id, stream }));
+                } else if let Some(job) = self.jobs.get_mut(&video_id) {
+                    job.warm = false; // already running: its answer serves this request
+                } else {
+                    self.start_job(video_id, false);
+                }
+            }
+            Effect::Forget(video_id) => {
+                self.cache.remove(&video_id);
+                self.patient.insert(video_id);
             }
             Effect::FetchRadio(video_id) => {
                 let fut = self.backend.radio(video_id.clone());
@@ -607,7 +714,11 @@ mod tests {
             }
             Ok(())
         }
-        fn resolve(&self, id: String) -> BoxFuture<'static, Result<Stream, String>> {
+        fn resolve(&self, id: String, patient: bool) -> BoxFuture<'static, Result<Stream, String>> {
+            self.log.lock().unwrap().push(format!(
+                "resolve {id}{}",
+                if patient { " patient" } else { "" }
+            ));
             let fail = id == self.fail;
             async move {
                 if fail {
@@ -747,6 +858,48 @@ mod tests {
         assert_eq!(loads, ["load a"]);
     }
 
+    fn count(log: &Log, line: &str) -> usize {
+        log.lock().unwrap().iter().filter(|l| *l == line).count()
+    }
+
+    #[tokio::test]
+    async fn warm_cache_hit_and_manual_next_resolve_once() {
+        let r = rig("warm", "");
+        r.handle.send(Command::Warm(vec!["a".into(), "b".into()]));
+        r.wait_for("resolve a").await;
+        r.wait_for("resolve b").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        r.handle.send(play(&["a", "b", "c"]));
+        r.wait_for("load a").await;
+        r.ev(Event::FileLoaded);
+        r.wait_for("append b").await;
+        // Manual Next: b was resolved and appended, now it is a cache hit.
+        r.handle.send(Command::Next);
+        r.wait_for("load b").await;
+        r.ev(Event::FileLoaded);
+        r.wait_for("append c").await;
+        let log = r.log.clone();
+        r.finish().await;
+        for id in ["a", "b"] {
+            assert_eq!(count(&log, &format!("resolve {id}")), 1, "{id}");
+        }
+        assert_eq!(count(&log, "resolve c"), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_stream_is_dropped_and_resolved_patiently_once() {
+        let r = rig("retry", "");
+        r.handle.send(play(&["a", "b"]));
+        r.wait_for("load a").await;
+        r.ev(Event::EndFile(EndReason::Error("403".into())));
+        r.wait_for("resolve a patient").await;
+        r.ev(Event::FileLoaded);
+        let log = r.log.clone();
+        let snaps = r.finish().await;
+        assert_eq!(count(&log, "load a"), 2);
+        assert_eq!(snaps.last().unwrap().status, Status::Playing);
+    }
+
     #[tokio::test]
     async fn failed_resolve_skips_the_track() {
         let r = rig("fail", "b");
@@ -760,7 +913,8 @@ mod tests {
         assert!(snaps
             .iter()
             .any(|s| s.cursor == Some(2) && s.last_error.as_deref() == Some("b unavailable")));
-        assert!(!log.lock().unwrap().iter().any(|l| l.ends_with(" b")));
+        let log = log.lock().unwrap();
+        assert!(!log.iter().any(|l| l == "load b" || l == "append b"));
     }
 
     #[tokio::test]

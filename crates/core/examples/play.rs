@@ -1,7 +1,7 @@
 //! Scriptable headless run through the real engine:
 //! `cargo run --release -p cmusic-core --example play -- <step> <step> ...`
 //!
-//! Steps: `play:<id>[,<id>...]` `search:<query>` `wait:<secs>` `seek:<secs>` `pause` `resume`
+//! Steps: `play:<id>[,<id>...]` `search:<query>` `warm:<id>[,<id>...]` `wait:<secs>` `ttfa` `seek:<secs>` `pause` `resume`
 //! `toggle` `next` `prev` `volume:<0-100>` `remove:<index>` `shuffle` `repeat`
 //! `fetch:<liked|playlists|songs|albums|artists>` `quit`.
 //! Legacy form `play -- <id> [secs]` still works. Every update is printed with elapsed seconds;
@@ -168,6 +168,8 @@ impl Script {
                 if tracks.is_empty() {
                     return Err("search: no track results".into());
                 }
+                let ids: Vec<&str> = tracks.iter().map(|t| t.video_id.as_str()).collect();
+                println!("{} ids {}", stamp(self.t0), ids.join(","));
                 self.begin_play();
                 self.h.send(Command::PlayTracks { tracks, start: 0 });
             }
@@ -185,6 +187,21 @@ impl Script {
             "wait" => {
                 let s: f64 = arg.parse().map_err(|_| format!("bad wait {arg:?}"))?;
                 tokio::time::sleep(Duration::from_secs_f64(s)).await;
+            }
+            "warm" => self.h.send(Command::Warm(
+                arg.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(Into::into)
+                    .collect(),
+            )),
+            // Waits (max 30 s) until the pending TTFA has printed.
+            "ttfa" => {
+                for _ in 0..300 {
+                    if self.sh.lock().unwrap().pending.is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
             "seek" => {
                 let s: f64 = arg.parse().map_err(|_| format!("bad seek {arg:?}"))?;

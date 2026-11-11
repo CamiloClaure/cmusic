@@ -140,7 +140,7 @@ fn run() -> i32 {
         for ev in std::iter::once(first).chain(rx.try_iter()) {
             match ev {
                 AppEvent::Key(k) => app.on_key(k).into_iter().for_each(|c| handle.send(c)),
-                AppEvent::Update(u) => app.on_update(u),
+                AppEvent::Update(u) => app.on_update(u).into_iter().for_each(|c| handle.send(c)),
                 AppEvent::Redraw => {}
                 AppEvent::EngineStopped => {
                     stopped = true;

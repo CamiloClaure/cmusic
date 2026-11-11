@@ -81,6 +81,8 @@ pub fn trim_bars(bytes: Vec<u8>) -> Vec<u8> {
 /// Art is requested for this many rows when a page loads.
 // ponytail: later rows keep the placeholder; request on scroll if that bothers anyone.
 pub const ART_ROWS: usize = 30;
+/// Rows of a page whose streams are resolved ahead of a click.
+const WARM_ROWS: usize = 3;
 const HISTORY_MAX: usize = 20;
 
 #[derive(Debug, Clone)]
@@ -498,6 +500,19 @@ impl State {
                                 }));
                         }
                         out.art = self.want_art(page.items.iter().take(ART_ROWS).map(thumb));
+                        // ponytail: the first rows of a fresh page only; no hover warming.
+                        let warm: Vec<String> = page
+                            .items
+                            .iter()
+                            .filter_map(|it| match it {
+                                Item::Track(t) => Some(t.video_id.clone()),
+                                _ => None,
+                            })
+                            .take(WARM_ROWS)
+                            .collect();
+                        if !warm.is_empty() {
+                            out.commands.push(Command::Warm(warm));
+                        }
                         if let Some(prev) = self.current.replace((request, page)) {
                             self.history.push(prev);
                             if self.history.len() > HISTORY_MAX {

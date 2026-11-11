@@ -83,7 +83,7 @@ Headless script through the real engine (prints every update, `TTFA <ms> <id>` f
 CMUSIC_AO=null cargo run --release -p cmusic-core --example play -- search:"daft punk" wait:15 seek:60 pause wait:2 resume next wait:10 quit
 ```
 
-Steps: `play:<id>[,<id>...]`, `search:<query>`, `wait:<secs>`, `seek:<secs>`, `pause`, `resume`, `toggle`, `next`, `prev`, `volume:<0-100>`, `remove:<index>`, `shuffle`, `repeat`, `fetch:<liked|playlists|songs|albums|artists>`, `quit`. The old `play -- <id> [secs]` form still works.
+Steps: `play:<id>[,<id>...]`, `search:<query>`, `warm:<id>[,<id>...]` (pre-resolve), `wait:<secs>`, `ttfa` (wait for the pending TTFA line), `seek:<secs>`, `pause`, `resume`, `toggle`, `next`, `prev`, `volume:<0-100>`, `remove:<index>`, `shuffle`, `repeat`, `fetch:<liked|playlists|songs|albums|artists>`, `quit`. The old `play -- <id> [secs]` form still works.
 
 Desktop app script: `CMUSIC_DEMO_SCRIPT="step;step;..."` runs the steps in order and is inert when unset. Under WSL the GUI uses X11 even when `WAYLAND_DISPLAY` is set (WSLg's Wayland compositor can stop answering); `CMUSIC_WAYLAND=1` keeps Wayland.
 

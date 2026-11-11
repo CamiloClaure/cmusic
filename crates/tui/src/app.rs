@@ -264,7 +264,8 @@ impl App {
         *sel = sel.saturating_add_signed(delta).min(last);
     }
 
-    pub fn on_update(&mut self, update: Update) {
+    /// Commands to send back (warming the first rows of a new page).
+    pub fn on_update(&mut self, update: Update) -> Vec<Command> {
         match update {
             Update::Player(s) => {
                 self.snap = s;
@@ -272,11 +273,21 @@ impl App {
             }
             Update::Page { request, result } => {
                 if self.awaiting.as_ref() != Some(&request) {
-                    return;
+                    return Vec::new();
                 }
                 self.awaiting = None;
                 match result {
                     Ok(page) => {
+                        // ponytail: the first rows of a fresh page only.
+                        let warm: Vec<String> = page
+                            .items
+                            .iter()
+                            .filter_map(|i| match i {
+                                Item::Track(t) => Some(t.video_id.clone()),
+                                _ => None,
+                            })
+                            .take(3)
+                            .collect();
                         if let Some(old) = self.page.replace(page) {
                             self.history.push((old, self.main_sel));
                             if self.history.len() > HISTORY_MAX {
@@ -284,6 +295,7 @@ impl App {
                             }
                         }
                         self.main_sel = 0;
+                        return vec![Command::Warm(warm)];
                     }
                     Err(m) => self.notice = m,
                 }
@@ -294,6 +306,7 @@ impl App {
             Update::AuthRequired(m) => self.notice = format!("{m} (run: cmusic login)"),
             Update::Notice(m) => self.notice = m,
         }
+        Vec::new()
     }
 }
 
