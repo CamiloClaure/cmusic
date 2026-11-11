@@ -1,7 +1,7 @@
-use crate::app::{thumb, Message, State, LIST, LYRICS, LYRIC_LH, NARROW, SEARCH};
+use crate::app::{thumb, Message, State, LIST, LYRICS, NARROW, SEARCH};
 use crate::icons;
 use crate::theme::Look;
-use cmusic_core::{lyrics, Item, PageRequest, Repeat, Status, Track};
+use cmusic_core::{lyrics, Item, Lyrics, PageRequest, Repeat, Status, Track};
 use iced::widget::svg::{self, Svg};
 use iced::widget::text::Wrapping;
 use iced::widget::{
@@ -43,14 +43,23 @@ pub fn view(s: &State) -> Element<'_, Message> {
         ]
         .spacing(l.gap)
     };
-    let content = column![
-        row![panel(l, sidebar(s)), middle.width(Fill)]
-            .spacing(l.gap)
-            .height(Fill),
-        panel(l, bar(s)),
-    ]
+    let mut content = column![row![panel(l, sidebar(s)), middle.width(Fill)]
+        .spacing(l.gap)
+        .height(Fill)]
     .spacing(l.gap)
     .padding(l.gap);
+    // Notices and playback errors wrap here (three lines at most) instead of being cut in the bar.
+    let in_login = s.login.as_ref().and_then(|g| g.message.as_deref());
+    let shown = s.notice.as_deref().or(s.snapshot.last_error.as_deref());
+    // The login panel already shows its own message.
+    if let Some(n) = shown.filter(|n| Some(*n) != in_login) {
+        let w = s.size.width - 4.0 * l.gap;
+        content = content.push(panel(
+            l,
+            text(fit(l, n, 2.8 * w, S)).size(sz(l, S)).width(Fill),
+        ));
+    }
+    let content = content.push(panel(l, bar(s)));
     // Glass needs something to sit on: the blurred art of the current track, dimmed by a scrim.
     let backdrop: Element<_> = match &s.backdrop {
         Some((_, h)) if l.backdrop => image(h.clone())
@@ -110,6 +119,47 @@ fn dim<'a>(l: Look, t: impl text::IntoFragment<'a>) -> iced::widget::Text<'a> {
 /// Rail width plus the gap an embedded scrollbar takes from its content.
 const RAIL: f32 = 16.0;
 
+/// Estimated advance of `c` at text size `em`.
+fn glyph(em: f32, c: char) -> f32 {
+    em * match c {
+        'i' | 'j' | 'l' | 'I' | '.' | ',' | ':' | ';' | '\'' | '|' | '!' => 0.3,
+        ' ' => 0.33,
+        'f' | 't' | 'r' | '(' | ')' | '[' | ']' | '-' | '/' => 0.4,
+        'm' | 'w' | 'M' | 'W' | '@' => 0.9,
+        'A'..='Z' | '&' => 0.7,
+        '0'..='9' => 0.64,
+        c if c as u32 >= 0x2e80 => 1.0,
+        _ => 0.62,
+    }
+}
+
+/// Word-wraps `t` for `width` px at text size `em` with explicit newlines (a word wider than a
+/// line is split), so the row count is known without asking the renderer.
+fn wrap(em: f32, t: &str, width: f32) -> String {
+    let mut out = String::new();
+    let mut x = 0.0;
+    for word in t.split_whitespace() {
+        let ww: f32 = word.chars().map(|c| glyph(em, c)).sum();
+        if x > 0.0 && x + glyph(em, ' ') + ww > width {
+            out.push('\n');
+            x = 0.0;
+        } else if x > 0.0 {
+            out.push(' ');
+            x += glyph(em, ' ');
+        }
+        for c in word.chars() {
+            let cw = glyph(em, c);
+            if x > 0.0 && x + cw > width {
+                out.push('\n');
+                x = 0.0;
+            }
+            out.push(c);
+            x += cw;
+        }
+    }
+    out
+}
+
 /// Shortens `t` to fit `width` px at base text size `base` (iced has no ellipsis), cutting on a
 /// char boundary and ending with "...".
 // ponytail: widths are per-class estimates of a DejaVu Sans (the usual Linux default), not measured; the text columns
@@ -117,18 +167,7 @@ const RAIL: f32 = 16.0;
 // advanced text API) is the upgrade.
 fn fit(l: Look, t: &str, width: f32, base: f32) -> String {
     let em = sz(l, base);
-    let w = |c: char| {
-        em * match c {
-            'i' | 'j' | 'l' | 'I' | '.' | ',' | ':' | ';' | '\'' | '|' | '!' => 0.3,
-            ' ' => 0.33,
-            'f' | 't' | 'r' | '(' | ')' | '[' | ']' | '-' | '/' => 0.4,
-            'm' | 'w' | 'M' | 'W' | '@' => 0.9,
-            'A'..='Z' | '&' => 0.7,
-            '0'..='9' => 0.64,
-            c if c as u32 >= 0x2e80 => 1.0,
-            _ => 0.62,
-        }
-    };
+    let w = |c: char| glyph(em, c);
     if t.chars().map(w).sum::<f32>() <= width {
         return t.to_string();
     }
@@ -275,12 +314,19 @@ fn sidebar(s: &State) -> Element<'_, Message> {
     ];
     column![
         search,
-        nav("Liked songs", PageRequest::LikedSongs),
-        nav("Playlists", PageRequest::LibraryPlaylists),
-        nav("Songs", PageRequest::LibrarySongs),
-        nav("Albums", PageRequest::LibraryAlbums),
-        nav("Artists", PageRequest::LibraryArtists),
-        space().height(Fill),
+        // Scrolls when a large font or a short window leaves no room for the five entries.
+        scrollable(
+            column![
+                nav("Liked songs", PageRequest::LikedSongs),
+                nav("Playlists", PageRequest::LibraryPlaylists),
+                nav("Songs", PageRequest::LibrarySongs),
+                nav("Albums", PageRequest::LibraryAlbums),
+                nav("Artists", PageRequest::LibraryArtists),
+            ]
+            .spacing(4)
+        )
+        .style(scroll(l))
+        .height(Fill),
         button(
             row![
                 ico(icons::user(), 16.0, l.text),
@@ -300,11 +346,20 @@ fn sidebar(s: &State) -> Element<'_, Message> {
 }
 
 /// Section title row: the title, then `trail` (a button, or nothing).
-fn head<'a>(l: Look, title: String, trail: Option<Element<'a, Message>>) -> Element<'a, Message> {
-    let mut r = row![text(title)
-        .size(sz(l, T))
-        .wrapping(Wrapping::None)
-        .width(Fill)]
+/// `room` is the width left for the title.
+fn head<'a>(
+    l: Look,
+    title: &str,
+    room: f32,
+    trail: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut r = row![container(
+        text(fit(l, title, room, T))
+            .size(sz(l, T))
+            .wrapping(Wrapping::None)
+    )
+    .width(Fill)
+    .clip(true)]
     .spacing(l.pad)
     .align_y(Center)
     .height(HEAD);
@@ -317,12 +372,12 @@ fn head<'a>(l: Look, title: String, trail: Option<Element<'a, Message>>) -> Elem
 /// Centred message for loading, empty and first-start states.
 fn hint<'a>(
     l: Look,
-    title: Option<String>,
+    title: Option<(&str, f32)>,
     msg: impl text::IntoFragment<'a>,
 ) -> Element<'a, Message> {
     let mut c = column![].spacing(6).align_x(Center);
-    if let Some(t) = title {
-        c = c.push(text(t).size(sz(l, T)).center());
+    if let Some((t, room)) = title {
+        c = c.push(text(fit(l, t, room, T)).size(sz(l, T)).wrapping(Wrapping::None));
     }
     container(c.push(dim(l, msg).center())).center(Fill).into()
 }
@@ -350,8 +405,13 @@ fn main_area(s: &State) -> Element<'_, Message> {
         return lyrics_view(s);
     }
     let title = match (&s.awaiting, &s.current) {
-        (None, Some((_, p))) if s.failed.is_none() => p.title.clone(),
-        _ => String::new(),
+        (None, Some((_, p))) if s.failed.is_none() => p.title.as_str(),
+        _ => "",
+    };
+    let back_w = if s.history.is_empty() {
+        0.0
+    } else {
+        HEAD - 4.0 + l.pad
     };
     let back = (!s.history.is_empty()).then(|| {
         ibtn(
@@ -367,11 +427,12 @@ fn main_area(s: &State) -> Element<'_, Message> {
     // Panel inner width minus the scrollbar, row paddings (list and button), art, the gaps
     // around the text and the duration column.
     let avail = (main_w(s) - RAIL - 6.0 * l.pad - 40.0 - DUR).max(80.0);
+    let mw = main_w(s);
     let body: Element<_> = match (&s.awaiting, &s.current) {
-        (Some(r), _) => hint(l, Some(request_name(r)), "Loading..."),
+        (Some(r), _) => hint(l, Some((&request_name(r), mw)), "Loading..."),
         (None, _) if s.failed.is_some() => {
             let (r, e) = s.failed.as_ref().expect("checked by the guard");
-            hint(l, Some(request_name(r)), e.as_str())
+            hint(l, Some((&request_name(r), mw)), e.as_str())
         }
         (None, Some((_, p))) if !p.items.is_empty() => {
             let mut rows = column![].spacing(4);
@@ -395,17 +456,27 @@ fn main_area(s: &State) -> Element<'_, Message> {
                 list.into()
             }
         }
+        (None, Some((PageRequest::Search(q), _))) => hint(
+            l,
+            None,
+            fit(l, &format!("No results for \"{q}\""), mw, S),
+        ),
         (None, Some(_)) => hint(l, None, "Nothing here"),
         (None, None) => hint(
             l,
-            Some("Welcome to cmusic".into()),
+            Some(("Welcome to cmusic", mw)),
             "Type in the search box on the left, or pick something from your library.",
         ),
     };
     column![
         row![]
             .extend(back)
-            .push(head(l, title, None))
+            .push(head(
+                l,
+                title,
+                mw - back_w,
+                None,
+            ))
             .spacing(l.pad)
             .align_y(Center),
         body
@@ -552,36 +623,65 @@ fn item_row<'a>(s: &'a State, i: usize, it: &'a Item, w: f32) -> Element<'a, Mes
     list_row(l, body, press, Some(actions.into()))
 }
 
+/// Lyrics text sizes, and the vertical padding inside each line's block.
+const LY_SIZE: f32 = 18.0;
+const LY_CUR: f32 = 21.0;
+const LY_PAD: f32 = 6.0;
+
+/// Width the lyrics lines wrap to.
+pub fn lyric_w(s: &State) -> f32 {
+    main_w(s) - RAIL - 2.0 * s.look.pad
+}
+
+/// A lyrics line wrapped to `w`, and the height of its block (the current line is bigger).
+// ponytail: 1.3 is iced's default line height; wrapping is estimated with `glyph`, not measured.
+fn lyric_block(l: Look, t: &str, cur: bool, w: f32) -> (String, f32) {
+    let size = sz(l, if cur { LY_CUR } else { LY_SIZE });
+    let wrapped = wrap(size, t, w * 0.92);
+    let rows = wrapped.lines().count().max(1) as f32;
+    (wrapped, rows * size * 1.3 + 2.0 * LY_PAD)
+}
+
+/// Offset, from the top of the first line, of the middle of line `i` (current, so bigger).
+pub fn lyric_centre(l: Look, ly: &Lyrics, i: usize, w: f32) -> f32 {
+    let above: f32 = ly.lines[..i]
+        .iter()
+        .map(|(_, t)| lyric_block(l, t, false, w).1)
+        .sum();
+    above + lyric_block(l, &ly.lines[i].1, true, w).1 / 2.0
+}
+
 fn lyrics_view(s: &State) -> Element<'_, Message> {
     let l = s.look;
+    let mut synced = true;
     let body: Element<_> = match s.current_lyrics() {
         Some(ly) if !ly.lines.is_empty() => {
             let cur = lyrics::current_line(ly, s.snapshot.position_secs);
             // Plain lyrics have no times: all lines at normal strength, none highlighted.
-            let synced = ly.lines.iter().any(|(t, _)| t.is_some());
-            let w = main_w(s) - RAIL - 2.0 * l.pad;
-            // Fixed line height (no wrapping) so the auto-scroll offset is exact.
+            synced = ly.lines.iter().any(|(t, _)| t.is_some());
+            let w = lyric_w(s);
             let mut c = column![];
             for (i, (_, t)) in ly.lines.iter().enumerate() {
-                let t = text(fit(l, t, w, 21.0))
-                    .size(sz(l, 18.0))
-                    .wrapping(Wrapping::None);
-                let t = match (synced, Some(i) == cur) {
-                    (true, true) => t.size(sz(l, 21.0)).color(l.accent_a),
+                let on = synced && Some(i) == cur;
+                let (wrapped, h) = lyric_block(l, t, on, w);
+                let t = text(wrapped)
+                    .size(sz(l, if on { LY_CUR } else { LY_SIZE }))
+                    .wrapping(Wrapping::None)
+                    .width(Fill)
+                    .align_x(Center);
+                let t = match (synced, on) {
+                    (true, true) => t.color(l.accent_a),
                     (true, false) => t.color(tint(l.text_dim, 0.55)),
                     _ => t.color(l.text),
                 };
-                c = c.push(
-                    container(t)
-                        .width(Fill)
-                        .height(LYRIC_LH * l.font_scale)
-                        .center_x(Fill)
-                        .align_y(Center),
-                );
+                c = c.push(container(t).width(Fill).height(h).align_y(Center));
             }
             scrollable(c.padding(l.pad))
                 .id(LYRICS)
-                .on_scroll(|v| Message::LyricsScrolled(v.bounds().height))
+                .on_scroll(|v| {
+                    let (b, c) = (v.bounds().height, v.content_bounds().height);
+                    Message::LyricsScrolled(b, v.absolute_offset().y, (c - b).max(0.0))
+                })
                 .spacing(6)
                 .style(scroll(l))
                 .height(Fill)
@@ -590,55 +690,95 @@ fn lyrics_view(s: &State) -> Element<'_, Message> {
         }
         _ => hint(l, None, "No lyrics"),
     };
-    column![head(l, "Lyrics".into(), None), body]
+    let mut c = column![head(l, "Lyrics", main_w(s), None)]
         .spacing(l.pad)
-        .width(Fill)
-        .into()
+        .width(Fill);
+    if !synced {
+        c = c.push(dim(l, "Lyrics are not time-synced"));
+    }
+    c.push(body).into()
 }
 
 fn login(s: &State) -> Element<'_, Message> {
     let l = s.look;
     let lg = s.login.as_ref().expect("checked by caller");
-    let form = column![
-        text("Log in").size(sz(l, T)),
-        txt(
-            l,
-            lg.message
-                .as_deref()
-                .unwrap_or("Import your YouTube Music cookies.")
-        ),
-        button(txt(l, "Import from browser"))
-            .on_press(Message::ImportBrowsers)
-            .style(pill(l, true)),
-        txt(l, "Or paste the Cookie header:"),
-        dim(
-            l,
-            "1. Open music.youtube.com signed in, press F12 and open the Network tab.\n\
-             2. Reload the page and click a request named \"browse\".\n\
-             3. Under Request Headers copy the whole value of \"cookie\".",
-        ),
-        text_input("Cookie: ...", &lg.cookie)
-            .secure(true)
-            .on_input(Message::CookieInput)
-            .on_submit(Message::UseCookie)
-            .padding([8, 14])
-            .size(sz(l, B))
-            .style(field(l)),
-        dim(l, "It stays on this computer, in a file only you can read.",),
+    let fw = (main_w(s) - RAIL).min(520.0);
+    let pill_btn = |label: &'static str, m: Message, on: bool| {
+        button(txt(l, label)).on_press(m).style(pill(l, on))
+    };
+    let mut state = row![txt(
+        l,
+        if s.logged_in {
+            "Signed in"
+        } else {
+            "Not signed in"
+        }
+    )
+    .width(Fill)]
+    .align_y(Center);
+    if s.logged_in {
+        state = state.push(pill_btn("Log out", Message::Logout, false));
+    }
+    let mut form = column![state].spacing(l.pad + 2.0).width(fw);
+    // The reason (or progress) comes first, at most three lines.
+    if let Some(m) = &lg.message {
+        form = form.push(text(fit(l, m, 3.0 * fw, B)).size(sz(l, B)).color(l.accent_a));
+    }
+    let form = form.push(dim(
+        l,
+        "Three ways to sign in to YouTube Music:\n\
+         A. Import from browser: reads the cookies of a browser installed on this computer \
+         (Firefox, or Chrome, Edge or Brave on Linux and macOS).",
+    ))
+    .push(pill_btn("Import from browser", Message::ImportBrowsers, true))
+    .push(dim(
+        l,
+        "B. Paste your cookie. In your browser, signed in at music.youtube.com:\n\
+         1. Press F12 or Ctrl+Shift+I and open the Network tab.\n\
+         2. Reload the page and click a request named \"browse\".\n\
+         3. Open Headers, then Request Headers.\n\
+         4. Right-click the \"cookie\" value, choose Copy value and paste it here:",
+    ))
+    .push(
         row![
-            button(txt(l, "Use pasted cookie"))
-                .on_press(Message::UseCookie)
-                .style(pill(l, false)),
-            button(txt(l, "Close"))
-                .on_press(Message::CloseLogin)
-                .style(pill(l, false)),
+            text_input("Cookie: ...", &lg.cookie)
+                .secure(true)
+                .on_input(Message::CookieInput)
+                .on_submit(Message::UseCookie)
+                .padding([8, 14])
+                .size(sz(l, B))
+                .style(field(l)),
+            pill_btn("Use pasted cookie", Message::UseCookie, false),
         ]
-        .spacing(l.pad),
+        .spacing(l.pad)
+        .align_y(Center),
+    )
+    .push(dim(
+        l,
+        "C. In a terminal: cmusic login --file cookies.txt\n\
+         The cookie stays on this computer, in a file only you can read.",
+    ));
+    // Fixed header (the Close button stays reachable), scrolling body.
+    let body = scrollable(container(form).padding(Padding {
+        right: RAIL,
+        ..Padding::ZERO
+    }))
+    .spacing(6)
+    .style(scroll(l))
+    .height(Fill)
+    .width(Fill);
+    column![
+        head(
+            l,
+            "Account",
+            main_w(s) - 80.0 * l.font_scale,
+            Some(pill_btn("Close", Message::CloseLogin, false).into())
+        ),
+        container(body).center_x(Fill).height(Fill),
     ]
-    .spacing(l.pad + 4.0)
+    .spacing(l.pad)
     .width(Fill)
-    .max_width(480);
-    container(form).center(Fill).padding(l.pad).into()
+    .into()
 }
 
 fn queue(s: &State, qw: f32) -> Element<'_, Message> {
@@ -702,7 +842,8 @@ fn queue(s: &State, qw: f32) -> Element<'_, Message> {
     column![
         head(
             l,
-            "Queue".into(),
+            "Queue",
+            qw - 70.0 * l.font_scale,
             Some(
                 button(txt(l, "Clear"))
                     .on_press_maybe((!snap.queue.is_empty()).then_some(Message::ClearQueue))
@@ -729,8 +870,8 @@ fn bar(s: &State) -> Element<'_, Message> {
         Status::Error => "Error",
         _ => "",
     };
-    let w = 220.0;
-    // Fixed three lines so a notice never moves anything.
+    // Narrow windows share one row with the transport and the toggles.
+    let w = if narrow(s) { 150.0 } else { 220.0 };
     let info = column![
         line(
             l,
@@ -745,20 +886,6 @@ fn bar(s: &State) -> Element<'_, Message> {
                     ("", None) => "",
                     (st, _) => st,
                 },
-                w,
-                S
-            )
-        )
-        .wrapping(Wrapping::None)
-        .height(sz(l, S) * 1.4),
-        dim(
-            l,
-            fit(
-                l,
-                s.notice
-                    .as_deref()
-                    .or(snap.last_error.as_deref())
-                    .unwrap_or(""),
                 w,
                 S
             )
@@ -855,7 +982,7 @@ fn bar(s: &State) -> Element<'_, Message> {
         ),
         tog(
             icons::palette(),
-            &format!("Theme: {}", s.theme_name),
+            &format!("Theme: {}", fit(l, &s.theme_name, 300.0, S)),
             false,
             Message::CycleTheme
         ),
@@ -908,15 +1035,17 @@ fn bar(s: &State) -> Element<'_, Message> {
         column![toggles, volume]
             .spacing(l.pad)
             .align_x(Right)
-            .width(250),
+            .width(250.0 * l.font_scale.max(1.0)),
     ]
     .spacing(gap)
     .align_y(Center)
     .into()
 }
 
+/// The one clock format (rows, bar, seek bar): rounded to the nearest second, so 337.6 s and a
+/// listed 338 s read the same.
 fn mmss(secs: f64) -> String {
-    let s = secs.max(0.0) as u64;
+    let s = secs.max(0.0).round() as u64;
     format!("{}:{:02}", s / 60, s % 60)
 }
 

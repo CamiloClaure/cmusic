@@ -61,7 +61,10 @@ fn main() -> iced::Result {
         s.notice = notice.clone();
         // Unknown until the engine's first `Update::Session` (it checks a stored login live).
         s.logged_in = false;
-        (s, demo_start())
+        // A theme error found at startup is generation 0; it goes away like any notice.
+        let gone = Task::future(tokio::time::sleep(Duration::from_secs(15)))
+            .map(|_| Message::ClearNotice(0));
+        (s, Task::batch([demo_start(), gone]))
     };
     iced::application(init, update, view::view)
         .title("cmusic")
@@ -183,7 +186,7 @@ fn update(app: &mut State, msg: Message) -> Task<Message> {
     }
     if let Some(g) = notice_gen {
         tasks.push(
-            Task::future(tokio::time::sleep(Duration::from_secs(5)))
+            Task::future(tokio::time::sleep(Duration::from_secs(app.notice_secs)))
                 .map(move |_| Message::ClearNotice(g)),
         );
     }

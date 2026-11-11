@@ -62,9 +62,10 @@ Colours are `"#rrggbb"` or `"#rrggbbaa"`.
 | `control`, `control_border` | colour | Idle buttons and search field fill and outline (alpha is the base for hover) |
 | `scrim_top`, `scrim_bottom` | colour | Dimming layer over the backdrop |
 | `base` | 3 colours | Gradient behind the backdrop, or alone when it is off |
-| `radius_panel`, `radius_row` | number 0-40 | Corner radius of panels and list rows |
-| `gap`, `pad` | number 0-40 | Space between and inside panels; space between items |
-| `font_scale` | number 0.6-2 | Multiplier for every text size |
+| `radius_panel` | number 0-32 | Corner radius of panels |
+| `radius_row` | number 0-24 | Corner radius of list rows |
+| `gap`, `pad` | number 0-16 | Space between and inside panels; space between items |
+| `font_scale` | number 0.8-1.25 | Multiplier for every text size |
 | `backdrop` | true/false | Blurred album art behind the UI (false is cheapest to render) |
 | `backdrop_blur` | number 0-30 | Blur radius of the backdrop |
 | `backdrop_saturation` | number 0-4 | Colour boost of the backdrop |

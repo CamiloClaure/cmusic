@@ -96,11 +96,12 @@ impl Default for Look {
 impl Look {
     /// A typo must not make the UI unusable.
     fn clamped(mut self) -> Self {
-        self.radius_panel = self.radius_panel.clamp(0.0, 40.0);
-        self.radius_row = self.radius_row.clamp(0.0, 40.0);
-        self.gap = self.gap.clamp(0.0, 40.0);
-        self.pad = self.pad.clamp(0.0, 40.0);
-        self.font_scale = self.font_scale.clamp(0.6, 2.0);
+        // The layout holds at 800x500 across these ranges.
+        self.radius_panel = self.radius_panel.clamp(0.0, 32.0);
+        self.radius_row = self.radius_row.clamp(0.0, 24.0);
+        self.gap = self.gap.clamp(0.0, 16.0);
+        self.pad = self.pad.clamp(0.0, 16.0);
+        self.font_scale = self.font_scale.clamp(0.8, 1.25);
         self.backdrop_blur = self.backdrop_blur.clamp(0.0, 30.0);
         self.backdrop_saturation = self.backdrop_saturation.clamp(0.0, 4.0);
         self
@@ -224,7 +225,11 @@ pub fn load(name: &str) -> Result<Look, String> {
     let file = format!("{name}.json");
     let text =
         std::fs::read_to_string(themes_dir().join(&file)).map_err(|e| format!("{file}: {e}"))?;
-    parse(&text).map_err(|e| format!("{file}: {e}"))
+    // serde lists every valid key after "unknown field"; the culprit is what the user needs.
+    parse(&text).map_err(|e| {
+        let e = e.to_string();
+        format!("{file}: {}", e.split(", expected one of").next().unwrap_or(&e))
+    })
 }
 
 fn parse(text: &str) -> Result<Look, serde_json::Error> {
@@ -263,7 +268,9 @@ mod tests {
     fn numbers_are_clamped() {
         let l =
             parse(r#"{"font_scale":50,"gap":-3,"radius_panel":999,"backdrop_blur":1e6}"#).unwrap();
-        assert_eq!((l.font_scale, l.gap, l.radius_panel), (2.0, 0.0, 40.0));
+        assert_eq!((l.font_scale, l.gap, l.radius_panel), (1.25, 0.0, 32.0));
+        let l = parse(r#"{"font_scale":0.1,"gap":99,"pad":99,"radius_row":99}"#).unwrap();
+        assert_eq!((l.font_scale, l.gap, l.pad, l.radius_row), (0.8, 16.0, 16.0, 24.0));
         assert_eq!(l.backdrop_blur, 30.0);
     }
 
