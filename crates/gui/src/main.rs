@@ -59,7 +59,8 @@ fn main() -> iced::Result {
         s.look = look;
         s.theme_name = theme_name.clone();
         s.notice = notice.clone();
-        s.logged_in = cmusic_core::auth::logged_in();
+        // Unknown until the engine's first `Update::Session` (it checks a stored login live).
+        s.logged_in = false;
         (s, demo_start())
     };
     iced::application(init, update, view::view)

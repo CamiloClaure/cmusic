@@ -16,6 +16,8 @@ Existing clients break playback after a few songs, eat memory (Electron), treat 
 ## Login
 `cmusic login` imports the YouTube cookies from your browser. Firefox works everywhere. Chrome, Edge and Brave work on Linux and macOS; on Windows they encrypt cookies per app, so use `cmusic login --paste` (paste the `Cookie` header from the browser dev tools) or `cmusic login --file cookies.txt`.
 
+A new login is checked with YouTube before it replaces the saved one: a rejected set is never kept, and without a connection an existing login is left alone. `cmusic logout` deletes the saved login (the desktop app has the same as a core command, `Command::Logout`). Pasted values over 16 kB, or a single cookie over 4 kB, are refused.
+
 Cookies are stored in one owner-only file in the config folder.
 
 ## Build
@@ -83,7 +85,7 @@ Headless script through the real engine (prints every update, `TTFA <ms> <id>` f
 CMUSIC_AO=null cargo run --release -p cmusic-core --example play -- search:"daft punk" wait:15 seek:60 pause wait:2 resume next wait:10 quit
 ```
 
-Steps: `play:<id>[,<id>...]`, `search:<query>`, `warm:<id>[,<id>...]` (pre-resolve), `wait:<secs>`, `ttfa` (wait for the pending TTFA line), `seek:<secs>`, `pause`, `resume`, `toggle`, `next`, `prev`, `volume:<0-100>`, `remove:<index>`, `shuffle`, `repeat`, `fetch:<liked|playlists|songs|albums|artists>`, `quit`. The old `play -- <id> [secs]` form still works.
+Steps: `play:<id>[,<id>...]`, `search:<query>`, `warm:<id>[,<id>...]` (pre-resolve), `wait:<secs>`, `ttfa` (wait for the pending TTFA line), `seek:<secs>`, `pause`, `resume`, `toggle`, `next`, `prev`, `volume:<0-100>`, `remove:<index>`, `shuffle`, `repeat`, `logout`, `fetch:<liked|playlists|songs|albums|artists>`, `quit`. The old `play -- <id> [secs]` form still works.
 
 Desktop app script: `CMUSIC_DEMO_SCRIPT="step;step;..."` runs the steps in order and is inert when unset. Under WSL the GUI uses X11 even when `WAYLAND_DISPLAY` is set (WSLg's Wayland compositor can stop answering); `CMUSIC_WAYLAND=1` keeps Wayland.
 

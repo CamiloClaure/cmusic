@@ -48,7 +48,8 @@ pub struct Snapshot {
     pub shuffle: bool,
     pub repeat: Repeat,
     pub normalize: bool,
-    /// Last playback failure, shown to the user. Cleared when a track starts playing.
+    /// Last playback failure, shown to the user. Cleared when a track starts playing; a skipped
+    /// track also arrives as an `Update::Notice` that outlives it.
     pub last_error: Option<String>,
 }
 
@@ -163,9 +164,13 @@ pub enum Command {
     /// Resolve these video ids ahead of time (the first few rows of a page) so playing one is
     /// instant. Best effort, replaces the previous list, never shown to the user.
     Warm(Vec<String>),
-    // Login. Success arrives as `Update::Notice("Logged in")`, failure as `Update::AuthRequired`,
-    // an unverifiable save as `Update::Session(None)`.
+    // Login. The new cookies are checked with YouTube before they replace a stored login.
+    // Success arrives as `Update::Session(Some(true))` then `Update::Notice("Logged in")`,
+    // failure (nothing saved, a stored login stays) as `Update::AuthRequired(message)`,
+    // a save that could not be checked as `Update::Session(None)` plus a notice.
     ImportCookies(CookieSource),
+    /// Delete the stored login. Answers `Update::Session(Some(false))` and a "Logged out" notice.
+    Logout,
     /// Save state and stop the engine.
     Quit,
 }
@@ -186,7 +191,10 @@ pub enum Update {
     AuthRequired(String),
     /// One-line message for a status bar (errors included).
     Notice(String),
-    /// What the live login check found: `Some(false)` means the stored session is dead (sent
-    /// once at startup), `None` that cookies were saved but YouTube could not be reached.
+    /// What the live login check found. Sent once at startup when a login file exists (until
+    /// then the login is unknown: show "logged out" without asking for a login), and after
+    /// every import or logout. `Some(true)` signed in, `Some(false)` no login or a dead one
+    /// (the message to show comes as `AuthRequired` or `Notice`), `None` cookies exist but
+    /// YouTube could not be reached to check.
     Session(Option<bool>),
 }

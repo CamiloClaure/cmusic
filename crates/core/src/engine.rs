@@ -56,9 +56,12 @@ pub fn start(opts: Options) -> Result<(Handle, UnboundedReceiver<Update>), Strin
                 *slot = Some(Api::new().await);
                 drop(slot);
                 // A stored login may be dead; the front ends learn it here.
+                // The front ends treat a stored login as unknown until this answers.
                 if auth::logged_in() {
-                    if let Some(ok) = auth::signed_in().await {
-                        let _ = startup.send(Msg::Up(Update::Session(Some(ok))));
+                    let ok = auth::signed_in().await;
+                    let _ = startup.send(Msg::Up(Update::Session(ok)));
+                    if ok == Some(false) {
+                        let _ = startup.send(Msg::Up(Update::Notice(auth::EXPIRED.into())));
                     }
                 }
             });
@@ -132,11 +135,16 @@ impl Backend for Real {
             Effect::AppendNext(s) => m.append_next(s),
             Effect::ClearNext => m.clear_next(),
             Effect::SetPause(p) => m.set_pause(*p),
-            Effect::Seek(secs) => m.seek(*secs),
+            Effect::Seek(secs) => m.seek(*secs, false),
+            Effect::SeekExact(secs) => m.seek(*secs, true),
             Effect::SetVolume(v) => m.set_volume(*v),
             Effect::SetNormalize(on) => m.set_normalize(*on),
             Effect::Stop => m.stop(),
-            Effect::Resolve(_) | Effect::Forget(_) | Effect::FetchRadio(_) | Effect::Persist => {}
+            Effect::Resolve(_)
+            | Effect::Forget(_)
+            | Effect::FetchRadio(_)
+            | Effect::Notice(_)
+            | Effect::Persist => {}
         }
         Ok(())
     }
@@ -344,6 +352,7 @@ impl Engine {
         if let Some(s) = persist::load_from(&self.path) {
             self.event(Event::Restored {
                 queue: s.queue,
+                original: s.original,
                 cursor: s.cursor,
                 position_secs: s.position_secs,
                 volume: s.volume,
@@ -392,7 +401,8 @@ impl Engine {
             | Command::Rate { .. }
             | Command::AddToPlaylist { .. }
             | Command::RemoveFromPlaylist { .. }
-            | Command::ImportCookies(_) => {
+            | Command::ImportCookies(_)
+            | Command::Logout => {
                 let (api, tx) = (self.api.clone(), self.tx.clone());
                 tokio::spawn(async move {
                     for u in account(&api, c).await {
@@ -401,7 +411,13 @@ impl Engine {
                 });
             }
             Command::Warm(ids) => {
-                self.warm = ids.into_iter().take(WARM_MAX).collect();
+                // The playing track needs no warming (its row is the one just played).
+                let playing = self.st.wanted().into_iter().next();
+                self.warm = ids
+                    .into_iter()
+                    .filter(|id| Some(id) != playing.as_ref())
+                    .take(WARM_MAX)
+                    .collect();
                 self.pump();
             }
             c => {
@@ -540,12 +556,16 @@ impl Engine {
             Effect::FetchRadio(video_id) => {
                 let fut = self.backend.radio(video_id.clone());
                 tokio::spawn(async move {
+                    // Autoplay is a bonus: a failure is for the log, not for the user.
                     let tracks = fut.await.unwrap_or_else(|e| {
-                        let _ = tx.send(Msg::Up(Update::Notice(format!("Autoplay: {e}"))));
+                        log::warn!("autoplay for {video_id}: {e}");
                         Vec::new()
                     });
                     let _ = tx.send(Msg::Ev(Event::RadioFetched(video_id, tracks)));
                 });
+            }
+            Effect::Notice(m) => {
+                let _ = self.up.send(Update::Notice(m));
             }
             Effect::Persist => {
                 self.save_at
@@ -602,42 +622,56 @@ impl Engine {
     fn save(&mut self) {
         self.save_at = None;
         self.last_save = Instant::now();
-        let saved = persist::Saved::from(&self.st.snapshot());
+        let saved = persist::Saved {
+            original: self.st.original_ranks(),
+            ..persist::Saved::from(&self.st.snapshot())
+        };
         if let Err(e) = persist::save_to(&self.path, &saved) {
             log::warn!("saving {}: {e}", self.path.display());
         }
     }
 }
 
+/// Rebuilds the API client from whatever login file exists now.
+async fn reconnect(api: &ApiCell) {
+    let mut g = api.write().await;
+    match g.as_mut() {
+        Some(a) => a.reload_auth().await,
+        None => *g = Some(Api::new().await),
+    }
+}
+
 /// Runs one account/browsing command and returns the updates it produces.
 async fn account(api: &ApiCell, cmd: Command) -> Vec<Update> {
     if let Command::ImportCookies(src) = cmd {
-        let imported = tokio::task::spawn_blocking(move || auth::import(&src))
-            .await
-            .unwrap_or_else(|e| Err(format!("cookie import failed: {e}")));
-        if let Err(e) = imported {
-            return vec![Update::AuthRequired(e)];
-        }
-        let mut g = api.write().await;
-        match g.as_mut() {
-            Some(a) => a.reload_auth().await,
-            None => *g = Some(Api::new().await),
-        }
-        drop(g);
-        // The client always builds from a saved file; only YouTube can say if it is signed in.
-        return match auth::verify().await {
-            Some(true) => vec![Update::Notice("Logged in".into())],
-            Some(false) => vec![
-                Update::Session(Some(false)),
-                Update::AuthRequired(auth::rejected_message()),
+        let login = auth::import_verified(src).await;
+        let login = match login {
+            Ok(l) => l,
+            Err(e) => return vec![Update::AuthRequired(e)],
+        };
+        reconnect(api).await;
+        return match login {
+            auth::Login::Verified => vec![
+                Update::Session(Some(true)),
+                Update::Notice("Logged in".into()),
             ],
-            None => vec![
+            auth::Login::Unverified => vec![
                 Update::Session(None),
                 Update::Notice(
                     "Cookies saved, but the login could not be verified (no connection?)".into(),
                 ),
             ],
         };
+    }
+    if cmd == Command::Logout {
+        if let Err(e) = auth::logout() {
+            return vec![Update::Notice(format!("Could not log out: {e}"))];
+        }
+        reconnect(api).await;
+        return vec![
+            Update::Session(Some(false)),
+            Update::Notice("Logged out".into()),
+        ];
     }
     let (result, ok) = match cmd {
         Command::Fetch(request) => {
@@ -907,6 +941,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warm_skips_the_playing_row_and_takes_three_others() {
+        let r = rig("warm3", "");
+        r.handle.send(play(&["a"]));
+        r.wait_for("load a").await;
+        r.ev(Event::FileLoaded);
+        let rows: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        r.handle.send(Command::Warm(rows));
+        for id in ["b", "c", "d"] {
+            r.wait_for(&format!("resolve {id}")).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let log = r.log.clone();
+        r.finish().await;
+        assert_eq!(count(&log, "resolve a"), 1, "a plays, it is not warmed");
+        assert_eq!(count(&log, "resolve e"), 0);
+    }
+
+    #[tokio::test]
     async fn refused_stream_is_dropped_and_resolved_patiently_once() {
         let r = rig("retry", "");
         r.handle.send(play(&["a", "b"]));
@@ -965,7 +1017,7 @@ mod tests {
         r.ev(Event::TimePos(40.0));
         // Through the same channel as the events, to keep the order.
         r.inject.send(Msg::Cmd(Command::SeekTo(100.0))).unwrap();
-        r.wait_for("Seek(100.0)").await;
+        r.wait_for("Seek(99.0)").await;
         // The seek never completes, yet commands and events keep being processed...
         r.inject.send(Msg::Cmd(Command::SetVolume(33))).unwrap();
         r.wait_for("SetVolume(33)").await;
@@ -989,9 +1041,9 @@ mod tests {
         let snaps = r.finish().await;
         assert!(snaps
             .iter()
-            .any(|s| s.volume == 33 && s.position_secs == 100.0));
+            .any(|s| s.volume == 33 && s.position_secs == 99.0));
         assert!(snaps.iter().any(|s| s.status == Status::Loading
-            && s.position_secs == 100.0
+            && s.position_secs == 99.0
             && s.last_error
                 .as_deref()
                 .is_some_and(|e| e.contains("restarting"))));

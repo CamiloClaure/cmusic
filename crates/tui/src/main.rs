@@ -23,6 +23,7 @@ usage:
   cmusic login                import cookies from your browsers
   cmusic login --paste        read a Cookie header from stdin
   cmusic login --file <path>  import a Netscape cookies.txt
+  cmusic logout               delete the saved login
   cmusic --help | --version";
 
 fn main() {
@@ -43,6 +44,7 @@ fn main() {
             0
         }
         ["login", rest @ ..] => login(rest),
+        ["logout"] => logout(),
         _ => {
             eprintln!("{HELP}");
             2
@@ -77,26 +79,33 @@ fn login(args: &[&str]) -> i32 {
             return 2;
         }
     };
-    match auth::import(&source) {
-        Ok(()) => match auth::verify_blocking() {
-            Some(true) => {
-                println!(
-                    "Logged in (verified with YouTube). Cookies saved to {}",
-                    auth::cookie_path().display()
-                );
-                0
-            }
-            Some(false) => {
-                eprintln!("login failed: {}", auth::rejected_message());
-                1
-            }
-            None => {
-                eprintln!("Cookies saved, but the login could not be verified (no connection?)");
-                1
-            }
-        },
+    match auth::import_verified_blocking(source) {
+        Ok(auth::Login::Verified) => {
+            println!(
+                "Logged in (verified with YouTube). Cookies saved to {}",
+                auth::cookie_path().display()
+            );
+            0
+        }
+        Ok(auth::Login::Unverified) => {
+            eprintln!("Cookies saved, but the login could not be verified (no connection?)");
+            1
+        }
         Err(e) => {
             eprintln!("login failed: {e}");
+            1
+        }
+    }
+}
+
+fn logout() -> i32 {
+    match auth::logout() {
+        Ok(()) => {
+            println!("Logged out: the saved cookies are deleted");
+            0
+        }
+        Err(e) => {
+            eprintln!("could not log out: {e}");
             1
         }
     }

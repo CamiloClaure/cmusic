@@ -305,10 +305,7 @@ impl App {
             }
             Update::AuthRequired(m) => self.notice = format!("{m} (run: cmusic login)"),
             Update::Notice(m) => self.notice = m,
-            Update::Session(Some(false)) => {
-                self.notice =
-                    "Your saved YouTube login is no longer valid (run: cmusic login)".into()
-            }
+            // The engine sends the message (a notice) with it.
             Update::Session(_) => {}
         }
         Vec::new()

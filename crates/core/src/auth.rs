@@ -34,8 +34,80 @@ pub fn cookie_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("cookies.txt"))
 }
 
-pub fn import(source: &CookieSource) -> Result<(), String> {
-    import_to(&cookie_path(), source)
+/// The stored session is dead (YouTube says so) or lacks cookies.
+pub const EXPIRED: &str = "Your YouTube login has expired or is incomplete. Log in again.";
+
+/// What a successful `import_verified` found out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Login {
+    /// Saved, and YouTube says it is signed in.
+    Verified,
+    /// Saved, but YouTube could not be reached to check.
+    Unverified,
+}
+
+/// Imports a login from `source`. The new set is checked with YouTube first and replaces the
+/// stored file only when that does not make things worse: a rejected set is never kept, and
+/// when the check cannot run, an existing login is not overwritten. `Err` is a message for
+/// the user.
+pub async fn import_verified(source: CookieSource) -> Result<Login, String> {
+    let rows = tokio::task::spawn_blocking(move || rows_for(&source))
+        .await
+        .map_err(|e| format!("cookie import failed: {e}"))??;
+    let verdict = match header_of(&rows) {
+        Some(h) => fetch_logged_in(&h).await,
+        None => Some(false),
+    };
+    save_checked(&cookie_path(), &rows, verdict)
+}
+
+/// `import_verified` for code without a runtime (the `login` subcommand).
+pub fn import_verified_blocking(source: CookieSource) -> Result<Login, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(import_verified(source))
+}
+
+/// Writes `rows` unless `verdict` (YouTube's answer for them) says not to. See `import_verified`.
+fn save_checked(path: &Path, rows: &[Row], verdict: Option<bool>) -> Result<Login, String> {
+    let existed = path.exists();
+    // A stored login YouTube has not declared dead counts as working.
+    let working = header_from(path).is_some() && *CHECK.lock().unwrap() != Some(false);
+    let kept = if existed {
+        " Your stored login was left unchanged."
+    } else {
+        ""
+    };
+    match verdict {
+        Some(false) => {
+            let gone = missing(&names(rows));
+            let detail = if gone.is_empty() {
+                String::new()
+            } else {
+                format!(" (missing: {})", gone.join(", "))
+            };
+            return Err(format!(
+                "YouTube did not accept these cookies. Make sure you copied the whole Cookie \
+                 value from a request to music.youtube.com while signed in.{detail}{kept}"
+            ));
+        }
+        None if working => {
+            return Err(format!(
+                "The new login was not saved because it could not be verified \
+                 (no connection?).{kept}"
+            ));
+        }
+        _ => {}
+    }
+    write_atomic(path, &render(rows)).map_err(|e| format!("cannot save cookies: {e}"))?;
+    *CHECK.lock().unwrap() = verdict;
+    Ok(if verdict == Some(true) {
+        Login::Verified
+    } else {
+        Login::Unverified
+    })
 }
 
 /// `Cookie` header value for youtube.com, `None` if there is no file or no SAPISID.
@@ -81,26 +153,6 @@ fn missing(have: &[&str]) -> Vec<&'static str> {
 fn complete(rows: &[Row]) -> bool {
     let have = names(rows);
     SESSION.iter().any(|n| have.contains(n)) && SAPISID.iter().any(|n| have.contains(n))
-}
-
-/// Why YouTube would not accept the stored cookies, with what to do. Names only, no values.
-pub fn rejected_message() -> String {
-    let have: Vec<String> = std::fs::read_to_string(cookie_path())
-        .map(|t| {
-            names(&parse_netscape(&t))
-                .into_iter()
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    let have: Vec<&str> = have.iter().map(String::as_str).collect();
-    let gone = missing(&have);
-    let what = if gone.is_empty() {
-        String::new()
-    } else {
-        format!(" (session cookies missing: {})", gone.join(", "))
-    };
-    format!("YouTube did not accept these cookies{what}. {COPY}")
 }
 
 /// Is the stored login really signed in? `None` when YouTube could not be reached.
@@ -177,16 +229,38 @@ pub fn logout() -> std::io::Result<()> {
     }
 }
 
+/// Test helper: validate and save without asking YouTube.
+#[cfg(test)]
 fn import_to(path: &Path, source: &CookieSource) -> Result<(), String> {
+    let rows = rows_for(source)?;
+    write_atomic(path, &render(&rows)).map_err(|e| format!("cannot save cookies: {e}"))?;
+    *CHECK.lock().unwrap() = None;
+    Ok(())
+}
+
+/// Longest header and single value taken for a real Cookie header (they are a few KB).
+const MAX_HEADER: usize = 16 * 1024;
+const MAX_VALUE: usize = 4 * 1024;
+
+/// The cookies of `source`, checked to look like a signed-in YouTube session.
+fn rows_for(source: &CookieSource) -> Result<Vec<Row>, String> {
     let rows = match source {
         CookieSource::Browsers => from_browsers()?,
-        CookieSource::Header(s) => parse_header(s),
+        CookieSource::Header(s) => {
+            let rows = parse_header(s);
+            if s.len() > MAX_HEADER || rows.iter().any(|r| r.value.len() > MAX_VALUE) {
+                return Err("This does not look like a Cookie header.".into());
+            }
+            rows
+        }
         CookieSource::File(p) => {
-            let text = std::fs::read_to_string(p)
-                .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-            let rows = parse_netscape(&text);
+            let bytes =
+                std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+            let rows = String::from_utf8(bytes)
+                .map(|t| parse_netscape(&t))
+                .unwrap_or_default();
             if rows.is_empty() {
-                return Err(format!("{} is not a Netscape cookies.txt", p.display()));
+                return Err("This file is not a cookies.txt export.".into());
             }
             rows
         }
@@ -202,9 +276,7 @@ fn import_to(path: &Path, source: &CookieSource) -> Result<(), String> {
     if !have.contains(&"SAPISID") && !have.contains(&"__Secure-1PAPISID") {
         log::warn!("only the 3P cookie family is present, the live check decides");
     }
-    write_atomic(path, &render(&rows)).map_err(|e| format!("cannot save cookies: {e}"))?;
-    *CHECK.lock().unwrap() = None;
-    Ok(())
+    Ok(rows)
 }
 
 fn from_browsers() -> Result<Vec<Row>, String> {
@@ -336,17 +408,18 @@ fn render(rows: &[Row]) -> String {
 }
 
 fn header_from(path: &Path) -> Option<String> {
-    let rows: Vec<Row> = parse_netscape(&std::fs::read_to_string(path).ok()?)
-        .into_iter()
-        .filter(Row::is_youtube)
-        .collect();
+    header_of(&parse_netscape(&std::fs::read_to_string(path).ok()?))
+}
+
+fn header_of(rows: &[Row]) -> Option<String> {
+    let rows: Vec<&Row> = rows.iter().filter(|r| r.is_youtube()).collect();
     let find = |n: &str| rows.iter().find(|r| r.name == n).map(|r| r.value.clone());
     // The API client reads the hash input from `SAPISID=` and needs a `;` after it, so it goes
     // first. the 1P/3P APISID cookies carry the same value when SAPISID is missing.
     let sapisid = SAPISID.iter().find_map(|n| find(n))?;
     let mut seen = vec!["SAPISID"];
     let mut parts = vec![format!("SAPISID={sapisid}")];
-    for r in &rows {
+    for r in rows {
         if !seen.contains(&r.name.as_str()) {
             seen.push(&r.name);
             parts.push(format!("{}={}", r.name, r.value));
@@ -471,7 +544,7 @@ mod tests {
         assert!(import_to(&path, &CookieSource::File(src.clone())).is_err());
         std::fs::write(&src, "not a cookie file").unwrap();
         let err = import_to(&path, &CookieSource::File(src)).unwrap_err();
-        assert!(err.contains("Netscape"), "{err}");
+        assert!(err.contains("not a cookies.txt"), "{err}");
         assert!(!path.exists());
         assert_eq!(header_from(&path), None);
     }
@@ -520,6 +593,59 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("=y"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_rejected_or_unchecked_login_never_replaces_a_stored_one() {
+        let good = |v: &str| parse_header(&format!("SAPISID={v}; SID=s"));
+        let on_disk = |p: &Path| std::fs::read_to_string(p).unwrap();
+        // First login: a rejected set is not kept, an unchecked one is.
+        let path = tmp("checked");
+        let e = save_checked(&path, &good("a"), Some(false)).unwrap_err();
+        assert!(
+            e.starts_with("YouTube did not accept these cookies."),
+            "{e}"
+        );
+        assert!(
+            e.contains("(missing: HSID") && !e.contains("left unchanged"),
+            "{e}"
+        );
+        assert!(!path.exists());
+        assert_eq!(save_checked(&path, &good("a"), None), Ok(Login::Unverified));
+        // Now a login exists: neither a rejection nor "could not check" may overwrite it.
+        let before = on_disk(&path);
+        let e = save_checked(&path, &good("b"), Some(false)).unwrap_err();
+        assert!(e.contains("left unchanged"), "{e}");
+        let e = save_checked(&path, &good("b"), None).unwrap_err();
+        assert!(
+            e.contains("not saved") && e.contains("left unchanged"),
+            "{e}"
+        );
+        assert_eq!(on_disk(&path), before);
+        assert_eq!(
+            save_checked(&path, &good("b"), Some(true)),
+            Ok(Login::Verified)
+        );
+        assert!(on_disk(&path).contains("\tb\n"));
+    }
+
+    #[test]
+    fn oversized_and_binary_input_is_refused() {
+        let path = tmp("sizes");
+        let big = format!("SAPISID={}; SID=s", "x".repeat(5000));
+        for src in [
+            CookieSource::Header(big),
+            CookieSource::Header(format!("SAPISID=a; SID=b; PREF={}", "y; z=1".repeat(3000))),
+        ] {
+            let e = import_to(&path, &src).unwrap_err();
+            assert_eq!(e, "This does not look like a Cookie header.");
+        }
+        let bin = tmp("bin-src");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, [0xff, 0xfe, 0, 1, 2]).unwrap();
+        let e = import_to(&path, &CookieSource::File(bin)).unwrap_err();
+        assert_eq!(e, "This file is not a cookies.txt export.");
         assert!(!path.exists());
     }
 
