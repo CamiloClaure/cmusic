@@ -1,7 +1,7 @@
 //! Resolves a YouTube video id to a direct audio URL plus the HTTP headers
 //! googlevideo requires (without them it answers 403).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -81,7 +81,15 @@ async fn run(
     limit: Duration,
 ) -> Result<(Stream, f64), String> {
     let kind = if extra.is_empty() { "full" } else { "fast" };
-    let mut cmd = Command::new("yt-dlp");
+    let mut cmd = Command::new(bundled("yt-dlp").unwrap_or_else(|| "yt-dlp".into()));
+    // Logged in, yt-dlp needs a JS runtime; it only looks for deno on PATH by itself.
+    if let Some(deno) = bundled("deno") {
+        cmd.arg("--js-runtimes")
+            .arg(format!("deno:{}", deno.display()));
+    }
+    // A GUI process would flash a console window for every resolve.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     let format = if video { VIDEO } else { AUDIO };
     cmd.args(["-j", "-f", format, "--no-playlist", "--no-warnings"]);
     cmd.args(extra);
@@ -116,6 +124,13 @@ async fn run(
     let (mut stream, at) = parse(&out.stdout)?;
     stream.video = video;
     Ok((stream, at))
+}
+
+/// A tool shipped next to our executable (the Windows package), else `None` for the one on PATH.
+fn bundled(name: &str) -> Option<PathBuf> {
+    let exe = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let p = std::env::current_exe().ok()?.parent()?.join(exe);
+    p.is_file().then_some(p)
 }
 
 /// A yt-dlp error line as one short sentence for the user. The raw line goes to the log.

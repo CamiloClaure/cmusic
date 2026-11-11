@@ -1,3 +1,6 @@
+// No console window next to the GUI on Windows.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod icons;
 mod theme;

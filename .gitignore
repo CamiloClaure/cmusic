@@ -2,3 +2,4 @@
 /.worktrees
 *.log
 cookies.txt
+/dist
