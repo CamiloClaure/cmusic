@@ -50,8 +50,18 @@ pub fn start(opts: Options) -> Result<(Handle, UnboundedReceiver<Update>), Strin
         let api: ApiCell = Arc::new(RwLock::new(None));
         // Taken before anyone can read, so API users wait for the first connection instead of
         // seeing `None`, while startup and playback do not.
+        let startup = tx.clone();
         if let Ok(mut slot) = api.clone().try_write_owned() {
-            tokio::spawn(async move { *slot = Some(Api::new().await) });
+            tokio::spawn(async move {
+                *slot = Some(Api::new().await);
+                drop(slot);
+                // A stored login may be dead; the front ends learn it here.
+                if auth::logged_in() {
+                    if let Some(ok) = auth::signed_in().await {
+                        let _ = startup.send(Msg::Up(Update::Session(Some(ok))));
+                    }
+                }
+            });
         }
         let events = tx.clone();
         let media = Media::new(hwnd.map(|h| h as *mut std::ffi::c_void), move |c| {
@@ -613,11 +623,21 @@ async fn account(api: &ApiCell, cmd: Command) -> Vec<Update> {
             Some(a) => a.reload_auth().await,
             None => *g = Some(Api::new().await),
         }
-        return vec![if g.as_ref().is_some_and(Api::is_logged_in) {
-            Update::Notice("Logged in".into())
-        } else {
-            Update::AuthRequired("Cookies saved, but YouTube Music did not accept them".into())
-        }];
+        drop(g);
+        // The client always builds from a saved file; only YouTube can say if it is signed in.
+        return match auth::verify().await {
+            Some(true) => vec![Update::Notice("Logged in".into())],
+            Some(false) => vec![
+                Update::Session(Some(false)),
+                Update::AuthRequired(auth::rejected_message()),
+            ],
+            None => vec![
+                Update::Session(None),
+                Update::Notice(
+                    "Cookies saved, but the login could not be verified (no connection?)".into(),
+                ),
+            ],
+        };
     }
     let (result, ok) = match cmd {
         Command::Fetch(request) => {

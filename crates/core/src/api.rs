@@ -46,6 +46,33 @@ fn classify(e: ytmapi_rs::Error) -> (ApiError, bool) {
     }
 }
 
+// ponytail: ytmapi-rs hides the parse-failure kind behind `?`, so match its message text.
+fn is_parse_fault(e: &ApiError) -> bool {
+    matches!(e, ApiError::Other(m) if m.contains("not found in Api response"))
+}
+
+/// Maps a suspicious library result using the login check (`None`: could not be checked).
+fn refine(
+    res: Result<Page, ApiError>,
+    suspect: bool,
+    signed: Option<bool>,
+) -> Result<Page, ApiError> {
+    if !suspect {
+        return res;
+    }
+    match (signed, res) {
+        (Some(false), _) => Err(ApiError::Auth(auth::rejected_message())),
+        (Some(true), Err(e)) => {
+            log::warn!("library page did not parse while signed in: {e}");
+            let short: String = e.to_string().chars().take(80).collect();
+            Err(ApiError::Other(format!(
+                "YouTube changed this page, cmusic needs an update ({short})"
+            )))
+        }
+        (_, res) => res,
+    }
+}
+
 #[derive(Clone)]
 enum Yt {
     Anon(YtMusic<NoAuthToken>),
@@ -105,14 +132,30 @@ impl Api {
             | PageRequest::Playlist(_)
             | PageRequest::Album(_)
             | PageRequest::Artist(_) => any!(self, yt => public(yt, req).await),
-            PageRequest::LikedSongs => {
-                let page = public(self.auth()?, &PageRequest::Playlist("LM".into())).await?;
-                Ok(Page {
-                    title: "Liked songs".into(),
-                    ..page
-                })
+            _ => {
+                let yt = self.auth()?;
+                let res = match req {
+                    PageRequest::LikedSongs => public(yt, &PageRequest::Playlist("LM".into()))
+                        .await
+                        .map(|page| Page {
+                            title: "Liked songs".into(),
+                            ..page
+                        }),
+                    _ => library(yt, req).await,
+                };
+                // Anything that looks wrong gets the live login check, which tells a dead
+                // session from an empty library or a changed page.
+                let suspect = match &res {
+                    Ok(p) => p.items.is_empty(),
+                    Err(e) => is_parse_fault(e),
+                };
+                let signed = if suspect {
+                    auth::signed_in().await
+                } else {
+                    None
+                };
+                refine(res, suspect, signed)
             }
-            _ => library(self.auth()?, req).await,
         }
     }
 
@@ -605,6 +648,29 @@ mod tests {
     }
 
     #[test]
+    fn suspicious_results_follow_the_login_check() {
+        let empty = || Ok(Page::default());
+        let parse = || Err(ApiError::Other("Key /x not found in Api response.".into()));
+        assert!(is_parse_fault(&parse().unwrap_err()));
+        // Signed out: both an empty page and a parse fault become Auth.
+        for res in [empty(), parse()] {
+            assert!(
+                matches!(refine(res, true, Some(false)), Err(ApiError::Auth(m)) if m.contains("did not accept"))
+            );
+        }
+        // Signed in: empty stays empty, a parse fault says the page changed.
+        assert_eq!(refine(empty(), true, Some(true)), empty());
+        let e = refine(parse(), true, Some(true)).unwrap_err().to_string();
+        assert!(
+            e.starts_with("YouTube changed this page, cmusic needs an update ("),
+            "{e}"
+        );
+        // Unknown, or not suspect: untouched.
+        assert_eq!(refine(parse(), true, None), parse());
+        assert_eq!(refine(empty(), false, Some(false)), empty());
+    }
+
+    #[test]
     fn durations() {
         assert_eq!(parse_duration("3:45"), Some(225));
         assert_eq!(parse_duration("1:02:03"), Some(3723));
@@ -748,6 +814,7 @@ mod tests {
     async fn net_account_pages() {
         let api = Api::new().await;
         println!("logged_in: {}", api.is_logged_in());
+        println!("live check: {:?}", auth::verify().await);
         for req in [
             PageRequest::LibraryPlaylists,
             PageRequest::LibraryArtists,

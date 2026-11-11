@@ -610,7 +610,13 @@ fn login(s: &State) -> Element<'_, Message> {
         button(txt(l, "Import from browser"))
             .on_press(Message::ImportBrowsers)
             .style(pill(l, true)),
-        txt(l, "Or paste a Cookie header:"),
+        txt(l, "Or paste the Cookie header:"),
+        dim(
+            l,
+            "1. Open music.youtube.com signed in, press F12 and open the Network tab.\n\
+             2. Reload the page and click a request named \"browse\".\n\
+             3. Under Request Headers copy the whole value of \"cookie\".",
+        ),
         text_input("Cookie: ...", &lg.cookie)
             .secure(true)
             .on_input(Message::CookieInput)
@@ -618,7 +624,7 @@ fn login(s: &State) -> Element<'_, Message> {
             .padding([8, 14])
             .size(sz(l, B))
             .style(field(l)),
-        dim(l, "DevTools > Network > a request > Cookie header"),
+        dim(l, "It stays on this computer, in a file only you can read.",),
         row![
             button(txt(l, "Use pasted cookie"))
                 .on_press(Message::UseCookie)

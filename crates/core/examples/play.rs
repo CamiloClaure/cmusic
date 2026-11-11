@@ -102,6 +102,7 @@ fn describe(u: &Update, t0: Instant, sh: &Sh) {
         },
         Update::AuthRequired(m) => println!("{t} auth required: {m}"),
         Update::Notice(m) => println!("{t} notice: {m}"),
+        Update::Session(v) => println!("{t} session: {v:?}"),
     }
 }
 

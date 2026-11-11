@@ -43,11 +43,134 @@ pub fn cookie_header() -> Option<String> {
     header_from(&cookie_path())
 }
 
+/// The file holds a usable-looking login; `verify` says whether YouTube agrees.
 pub fn logged_in() -> bool {
     cookie_header().is_some()
 }
 
+const SESSION: [&str; 3] = ["__Secure-3PSID", "__Secure-1PSID", "SID"];
+const SAPISID: [&str; 3] = ["SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID"];
+/// What a complete browser login carries; used to tell the user what is missing.
+const EXPECTED: [&str; 9] = [
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "SAPISID",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "__Secure-1PAPISID",
+    "__Secure-3PAPISID",
+];
+const COPY: &str = "Copy the whole Cookie header of a request to music.youtube.com \
+    (DevTools > Network > any 'browse' request > Request Headers > Cookie) and paste it again.";
+
+fn names(rows: &[Row]) -> Vec<&str> {
+    rows.iter()
+        .filter(|r| r.is_youtube())
+        .map(|r| r.name.as_str())
+        .collect()
+}
+
+/// Names from `EXPECTED` that are not in `have`.
+fn missing(have: &[&str]) -> Vec<&'static str> {
+    EXPECTED.into_iter().filter(|n| !have.contains(n)).collect()
+}
+
+/// A session cookie and a SAPISID-family cookie, both for youtube.com.
+fn complete(rows: &[Row]) -> bool {
+    let have = names(rows);
+    SESSION.iter().any(|n| have.contains(n)) && SAPISID.iter().any(|n| have.contains(n))
+}
+
+/// Why YouTube would not accept the stored cookies, with what to do. Names only, no values.
+pub fn rejected_message() -> String {
+    let have: Vec<String> = std::fs::read_to_string(cookie_path())
+        .map(|t| {
+            names(&parse_netscape(&t))
+                .into_iter()
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let have: Vec<&str> = have.iter().map(String::as_str).collect();
+    let gone = missing(&have);
+    let what = if gone.is_empty() {
+        String::new()
+    } else {
+        format!(" (session cookies missing: {})", gone.join(", "))
+    };
+    format!("YouTube did not accept these cookies{what}. {COPY}")
+}
+
+/// Is the stored login really signed in? `None` when YouTube could not be reached.
+/// Cached after the first conclusive answer; import and logout reset it.
+pub async fn signed_in() -> Option<bool> {
+    if let Some(v) = *CHECK.lock().unwrap() {
+        return Some(v);
+    }
+    verify().await
+}
+
+/// Like `signed_in` but always asks YouTube.
+pub async fn verify() -> Option<bool> {
+    let Some(cookie) = cookie_header() else {
+        return Some(false);
+    };
+    let v = fetch_logged_in(&cookie).await;
+    log::debug!("login check: {v:?}");
+    *CHECK.lock().unwrap() = v;
+    v
+}
+
+/// `verify` for code without a runtime (the `login` subcommand).
+pub fn verify_blocking() -> Option<bool> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?
+        .block_on(verify())
+}
+
+static CHECK: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+async fn fetch_logged_in(cookie: &str) -> Option<bool> {
+    // ponytail: one GET of the music.youtube.com home page, the body is only searched, never logged.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/124.0.0.0 Safari/537.36",
+        )
+        .build()
+        .ok()?;
+    let body = client
+        .get("https://music.youtube.com/")
+        .header("Cookie", cookie)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    ytcfg_logged_in(&body)
+}
+
+/// `LOGGED_IN` from the ytcfg embedded in the page (plain or backslash-escaped JSON).
+fn ytcfg_logged_in(html: &str) -> Option<bool> {
+    let at = html.find("LOGGED_IN")?;
+    let rest = html[at + "LOGGED_IN".len()..].trim_start_matches(['\\', '"', ':', ' ']);
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 pub fn logout() -> std::io::Result<()> {
+    *CHECK.lock().unwrap() = None;
     match std::fs::remove_file(cookie_path()) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -68,19 +191,20 @@ fn import_to(path: &Path, source: &CookieSource) -> Result<(), String> {
             rows
         }
     };
-    if !has_sapisid(&rows) {
-        return Err(
-            "no SAPISID cookie for youtube.com found (it is what the API login is built from); \
-             make sure you are signed in to music.youtube.com"
-                .into(),
-        );
+    if !complete(&rows) {
+        let gone = missing(&names(&rows));
+        return Err(format!(
+            "These cookies are not a signed-in YouTube session (missing: {}). {COPY}",
+            gone.join(", ")
+        ));
     }
-    write_atomic(path, &render(&rows)).map_err(|e| format!("cannot save cookies: {e}"))
-}
-
-fn has_sapisid(rows: &[Row]) -> bool {
-    rows.iter()
-        .any(|r| r.is_youtube() && (r.name == "SAPISID" || r.name == "__Secure-3PAPISID"))
+    let have = names(&rows);
+    if !have.contains(&"SAPISID") && !have.contains(&"__Secure-1PAPISID") {
+        log::warn!("only the 3P cookie family is present, the live check decides");
+    }
+    write_atomic(path, &render(&rows)).map_err(|e| format!("cannot save cookies: {e}"))?;
+    *CHECK.lock().unwrap() = None;
+    Ok(())
 }
 
 fn from_browsers() -> Result<Vec<Row>, String> {
@@ -108,7 +232,7 @@ fn from_browsers() -> Result<Vec<Row>, String> {
                         http_only: c.http_only,
                     })
                     .collect();
-                if has_sapisid(&rows) {
+                if complete(&rows) {
                     return Ok(rows);
                 }
                 errors.push(format!("{name}: no signed-in YouTube session"));
@@ -136,7 +260,8 @@ fn parse_header(s: &str) -> Vec<Row> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
         + 2 * 365 * 24 * 3600;
-    s.split(';')
+    // Line breaks of a multi-line paste separate pairs like `;` does.
+    s.split([';', '\n', '\r'])
         .filter_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
             let (name, value) = (name.trim(), value.trim());
@@ -217,8 +342,8 @@ fn header_from(path: &Path) -> Option<String> {
         .collect();
     let find = |n: &str| rows.iter().find(|r| r.name == n).map(|r| r.value.clone());
     // The API client reads the hash input from `SAPISID=` and needs a `;` after it, so it goes
-    // first. __Secure-3PAPISID carries the same value when SAPISID is missing.
-    let sapisid = find("SAPISID").or_else(|| find("__Secure-3PAPISID"))?;
+    // first. the 1P/3P APISID cookies carry the same value when SAPISID is missing.
+    let sapisid = SAPISID.iter().find_map(|n| find(n))?;
     let mut seen = vec!["SAPISID"];
     let mut parts = vec![format!("SAPISID={sapisid}")];
     for r in &rows {
@@ -308,10 +433,11 @@ mod tests {
         let text = "# Netscape HTTP Cookie File\n\n\
             #HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1900000000\tSAPISID\tsecret\n\
             .youtube.com\tTRUE\t/\tFALSE\t0\tPREF\tf=1\n\
+            .youtube.com\tTRUE\t/\tTRUE\t0\tSID\ts\n\
             # a comment\n\
             .google.com\tTRUE\t/\tTRUE\t1900000000\tNID\tnope\n";
         let rows = parse_netscape(text);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert!(rows[0].http_only && rows[0].name == "SAPISID");
         assert!(!rows[1].http_only && !rows[1].secure);
         assert_eq!(parse_netscape(&render(&rows)), rows);
@@ -322,7 +448,10 @@ mod tests {
         std::fs::write(&src, text).unwrap();
         import_to(&dst, &CookieSource::File(src)).unwrap();
         // Only youtube.com cookies make it into the header.
-        assert_eq!(header_from(&dst).unwrap(), "SAPISID=secret; PREF=f=1");
+        assert_eq!(
+            header_from(&dst).unwrap(),
+            "SAPISID=secret; PREF=f=1; SID=s"
+        );
         assert!(std::fs::read_to_string(&dst)
             .unwrap()
             .contains("#HttpOnly_.youtube.com"));
@@ -345,6 +474,65 @@ mod tests {
         assert!(err.contains("Netscape"), "{err}");
         assert!(!path.exists());
         assert_eq!(header_from(&path), None);
+    }
+
+    #[test]
+    fn multi_line_paste_keeps_every_pair() {
+        let rows = parse_header("cookie:\r\nSID=a;\nHSID=b\r\n__Secure-3PSID=c; PREF=f=1\n");
+        assert_eq!(
+            pairs(&rows),
+            [
+                ("SID", "a"),
+                ("HSID", "b"),
+                ("__Secure-3PSID", "c"),
+                ("PREF", "f=1")
+            ]
+        );
+    }
+
+    #[test]
+    fn session_rules_and_missing_names() {
+        let row = |n: &str| parse_header(&format!("{n}=x")).remove(0);
+        let rows = |ns: &[&str]| ns.iter().map(|n| row(n)).collect::<Vec<_>>();
+        assert!(complete(&rows(&["__Secure-3PSID", "__Secure-3PAPISID"])));
+        assert!(complete(&rows(&["SID", "SAPISID"])));
+        assert!(!complete(&rows(&["__Secure-3PAPISID", "PREF"])));
+        assert!(!complete(&rows(&["SID", "PREF"])));
+        assert_eq!(
+            missing(&["SID", "__Secure-3PSID", "__Secure-3PAPISID", "PREF"]),
+            [
+                "HSID",
+                "SSID",
+                "APISID",
+                "SAPISID",
+                "__Secure-1PSID",
+                "__Secure-1PAPISID"
+            ]
+        );
+        let path = tmp("static");
+        let err = import_to(
+            &path,
+            &CookieSource::Header("PREF=1; __Secure-3PAPISID=y".into()),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("missing: SID, HSID") && err.contains("DevTools"),
+            "{err}"
+        );
+        assert!(!err.contains("=y"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn ytcfg_login_flag() {
+        assert_eq!(
+            ytcfg_logged_in(r#"ytcfg.set({"A":1,"LOGGED_IN":true,"B":2})"#),
+            Some(true)
+        );
+        assert_eq!(ytcfg_logged_in(r#"{"LOGGED_IN": false}"#), Some(false));
+        assert_eq!(ytcfg_logged_in(r#"{\"LOGGED_IN\":true}"#), Some(true));
+        assert_eq!(ytcfg_logged_in("<html>no config</html>"), None);
+        assert_eq!(ytcfg_logged_in(r#""LOGGED_IN":null"#), None);
     }
 
     #[cfg(unix)]

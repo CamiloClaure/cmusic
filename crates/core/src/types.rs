@@ -163,7 +163,8 @@ pub enum Command {
     /// Resolve these video ids ahead of time (the first few rows of a page) so playing one is
     /// instant. Best effort, replaces the previous list, never shown to the user.
     Warm(Vec<String>),
-    // Login. Success arrives as `Update::Notice`, failure as `Update::AuthRequired`.
+    // Login. Success arrives as `Update::Notice("Logged in")`, failure as `Update::AuthRequired`,
+    // an unverifiable save as `Update::Session(None)`.
     ImportCookies(CookieSource),
     /// Save state and stop the engine.
     Quit,
@@ -185,4 +186,7 @@ pub enum Update {
     AuthRequired(String),
     /// One-line message for a status bar (errors included).
     Notice(String),
+    /// What the live login check found: `Some(false)` means the stored session is dead (sent
+    /// once at startup), `None` that cookies were saved but YouTube could not be reached.
+    Session(Option<bool>),
 }

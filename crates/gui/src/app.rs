@@ -184,7 +184,7 @@ pub struct State {
     lyrics_h: f32,
     pub login: Option<Login>,
     pub notice: Option<String>,
-    /// Set at startup from the cookie file, then by the "Logged in" notice and `AuthRequired`.
+    /// Set at startup from the cookie file, then by the startup check (`Session`), the "Logged in" notice and `AuthRequired`.
     pub logged_in: bool,
     /// Local slider value while the seek slider is being dragged.
     pub drag: Option<f64>,
@@ -359,9 +359,11 @@ impl State {
             Message::ClearQueue => out.commands.push(Command::ClearQueue),
             Message::OpenLogin => self.login = Some(Login::default()),
             Message::CloseLogin => self.login = None,
-            Message::ImportBrowsers => out
-                .commands
-                .push(Command::ImportCookies(CookieSource::Browsers)),
+            Message::ImportBrowsers => {
+                self.checking();
+                out.commands
+                    .push(Command::ImportCookies(CookieSource::Browsers));
+            }
             Message::CookieInput(s) => {
                 if let Some(l) = &mut self.login {
                     l.cookie = s;
@@ -373,6 +375,7 @@ impl State {
                     if !c.is_empty() {
                         out.commands
                             .push(Command::ImportCookies(CookieSource::Header(c)));
+                        self.checking();
                     }
                 }
             }
@@ -466,6 +469,12 @@ impl State {
         ));
     }
 
+    fn checking(&mut self) {
+        if let Some(l) = &mut self.login {
+            l.message = Some("Checking the login with YouTube...".into());
+        }
+    }
+
     fn fetch(&mut self, r: PageRequest, out: &mut Out) {
         self.awaiting = Some(r.clone());
         self.failed = None;
@@ -541,9 +550,22 @@ impl State {
                 if n == "Logged in" {
                     self.login = None;
                     self.logged_in = true;
+                    // The page that asked for the login (or was loading) loads by itself.
+                    let pending = self.failed.take().map(|(r, _)| r).or(self.awaiting.take());
+                    if let Some(r) = pending {
+                        self.fetch(r, &mut out);
+                    }
                 }
                 self.set_notice(n);
             }
+            Update::Session(ok) => match ok {
+                Some(v) => self.logged_in = v,
+                // Saved but unverified: keep the cookies, close the form.
+                None => {
+                    self.login = None;
+                    self.logged_in = true;
+                }
+            },
         }
         out
     }
@@ -749,6 +771,35 @@ mod tests {
         s.update(Message::Engine(Update::Notice("Logged in".into())));
         assert!(s.login.is_none());
         assert!(s.logged_in);
+    }
+
+    #[test]
+    fn successful_login_refetches_the_pending_page() {
+        let mut s = state();
+        let req = PageRequest::LibraryPlaylists;
+        s.update(Message::Open(req.clone()));
+        s.update(Message::Engine(Update::Page {
+            request: req.clone(),
+            result: Err("log in".into()),
+        }));
+        s.update(Message::Engine(Update::AuthRequired("log in".into())));
+        assert!(s.login.is_some());
+        s.update(Message::CookieInput("SID=a".into()));
+        s.update(Message::UseCookie);
+        assert_eq!(
+            s.login.as_ref().unwrap().message.as_deref(),
+            Some("Checking the login with YouTube...")
+        );
+        // A rejected attempt keeps the form open and shows the error in it.
+        s.update(Message::Engine(Update::AuthRequired("nope".into())));
+        assert_eq!(s.login.as_ref().unwrap().message.as_deref(), Some("nope"));
+        let out = s.update(Message::Engine(Update::Notice("Logged in".into())));
+        assert!(s.login.is_none());
+        assert_eq!(out.commands, vec![Command::Fetch(req.clone())]);
+        assert_eq!(s.awaiting, Some(req));
+        // A dead stored session found at startup only flips the sidebar button.
+        s.update(Message::Engine(Update::Session(Some(false))));
+        assert!(!s.logged_in && s.login.is_none());
     }
 
     #[test]

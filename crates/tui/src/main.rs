@@ -58,7 +58,14 @@ fn login(args: &[&str]) -> i32 {
             eprint!("Paste the Cookie header value, then Enter: ");
             let _ = std::io::stderr().flush();
             let mut s = String::new();
-            if std::io::stdin().read_line(&mut s).is_err() {
+            let stdin = std::io::stdin();
+            // A pipe may hold a multi-line paste; a terminal ends at the first Enter.
+            let read = if std::io::IsTerminal::is_terminal(&stdin) {
+                stdin.read_line(&mut s)
+            } else {
+                std::io::Read::read_to_string(&mut stdin.lock(), &mut s)
+            };
+            if read.is_err() {
                 eprintln!("could not read stdin");
                 return 1;
             }
@@ -71,13 +78,23 @@ fn login(args: &[&str]) -> i32 {
         }
     };
     match auth::import(&source) {
-        Ok(()) => {
-            println!(
-                "Logged in. Cookies saved to {}",
-                auth::cookie_path().display()
-            );
-            0
-        }
+        Ok(()) => match auth::verify_blocking() {
+            Some(true) => {
+                println!(
+                    "Logged in (verified with YouTube). Cookies saved to {}",
+                    auth::cookie_path().display()
+                );
+                0
+            }
+            Some(false) => {
+                eprintln!("login failed: {}", auth::rejected_message());
+                1
+            }
+            None => {
+                eprintln!("Cookies saved, but the login could not be verified (no connection?)");
+                1
+            }
+        },
         Err(e) => {
             eprintln!("login failed: {e}");
             1
